@@ -32,8 +32,8 @@
 // Although some implementations adversize a max in transfer of 32K,
 // in practice, the largest transfer performed is the advertisements
 // which is 272 bytes at time of writing.
-#define SH2_HAL_MAX_TRANSFER_IN  (384)
-#define SH2_HAL_MAX_PAYLOAD_IN   (384)
+#define SH2_HAL_MAX_TRANSFER_IN  (512)
+#define SH2_HAL_MAX_PAYLOAD_IN   (512)
 
 // This needs to be a power of 2, greater than max of the above.
 #define SH2_HAL_DMA_SIZE (512)

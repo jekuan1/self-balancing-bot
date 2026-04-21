@@ -9,6 +9,8 @@
 #include "sh2_SensorValue.h"
 #include "sh2_hal.h"
 
+#define BNO08X_MAX_PACKET_LEN 512
+
 typedef struct {
     sh2_Hal_t hal;
 
@@ -23,6 +25,12 @@ typedef struct {
     volatile bool have_sample;
     sh2_SensorValue_t sensor_value;
     int64_t last_print_us;
+    uint8_t last_packet[BNO08X_MAX_PACKET_LEN];
+    uint16_t last_packet_len;
+    volatile bool packet_ready;
+    float pitch_deg;
+    bool pitch_valid;
+    uint8_t control_seq;
 
     int spi_host;
     int mosi_io;
@@ -42,6 +50,7 @@ typedef struct {
 
 esp_err_t imu_module_init(imu_module_t *imu);
 bool imu_module_probe(imu_module_t *imu, uint32_t timeout_ms);
+esp_err_t bno08x_enable_game_rv(uint32_t interval_us);
 void imu_module_enable_default_reports(imu_module_t *imu);
 void imu_module_poll_and_log(imu_module_t *imu);
 

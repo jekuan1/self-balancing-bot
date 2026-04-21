@@ -14,13 +14,71 @@
 #include "sh2_err.h"
 
 static const char *TAG = "imu_module";
+static imu_module_t *s_active_imu = NULL;
 
 #define IMU_I2C_TIMEOUT_MS 1000
 #define IMU_PROBE_READ_RETRY_MS 20
-#define IMU_REPORT_INTERVAL_US 5000
+#define IMU_GAME_RV_INTERVAL_US 5000
+#define IMU_MAX_RETRY_DRAIN_BYTES 64
 #define BNO08X_SENSOR_ADDR 0x4A
 #define BNO08X_ALT_SENSOR_ADDR 0x4B
 #define BNO08X_SOFT_RESET_LEN 5
+
+typedef struct __attribute__((packed)) {
+    uint8_t reportId;
+    uint8_t featureReportId;
+    uint8_t flags;
+    uint16_t changeSensitivity;
+    uint32_t reportInterval_uS;
+    uint32_t batchInterval_uS;
+    uint32_t sensorSpecific;
+} bno08x_set_feature_t;
+
+static uint16_t read_u16_le(const uint8_t *data)
+{
+    return (uint16_t)data[0] | ((uint16_t)data[1] << 8);
+}
+
+static float quat_to_pitch_deg(float real, float i, float j, float k)
+{
+    float norm = (i * i) + (j * j) + (k * k) + (real * real);
+    if (norm <= 0.0f) {
+        return 0.0f;
+    }
+
+    float pitch = asinf(-2.0f * (i * k - j * real) / norm);
+    return pitch * 57.2957795f;
+}
+
+static bool parse_game_rotation_packet(const uint8_t *packet, size_t len, float *pitch_deg)
+{
+    if (len < 21U) {
+        return false;
+    }
+
+    if (packet[2] != 3U || packet[4] != SH2_GAME_ROTATION_VECTOR) {
+        return false;
+    }
+
+    float qi = (float)((int16_t)read_u16_le(&packet[13])) / 16384.0f;
+    float qj = (float)((int16_t)read_u16_le(&packet[15])) / 16384.0f;
+    float qk = (float)((int16_t)read_u16_le(&packet[17])) / 16384.0f;
+    float qreal = (float)((int16_t)read_u16_le(&packet[19])) / 16384.0f;
+
+    *pitch_deg = quat_to_pitch_deg(qreal, qi, qj, qk);
+    return true;
+}
+
+static void capture_packet(imu_module_t *imu, const uint8_t *packet, uint16_t len)
+{
+    if (len > BNO08X_MAX_PACKET_LEN) {
+        len = BNO08X_MAX_PACKET_LEN;
+    }
+
+    memcpy(imu->last_packet, packet, len);
+    imu->last_packet_len = len;
+    imu->packet_ready = true;
+}
 
 static imu_module_t *imu_from_hal(sh2_Hal_t *self)
 {
@@ -32,6 +90,11 @@ static void imu_reset_report_state(imu_module_t *imu)
     imu->reset_seen = false;
     imu->have_sample = false;
     imu->last_print_us = 0;
+    imu->packet_ready = false;
+    imu->last_packet_len = 0;
+    imu->pitch_deg = 0.0f;
+    imu->pitch_valid = false;
+    imu->control_seq = 0;
     memset((void *)&imu->sensor_value, 0, sizeof(imu->sensor_value));
 }
 
@@ -106,22 +169,37 @@ static esp_err_t imu_send_soft_reset(imu_module_t *imu)
     return i2c_master_transmit(imu->i2c_dev, reset_pkt, sizeof(reset_pkt), IMU_I2C_TIMEOUT_MS);
 }
 
-static void quaternion_to_euler(float real, float i, float j, float k,
-                                float *yaw_deg, float *pitch_deg, float *roll_deg)
+esp_err_t bno08x_enable_game_rv(uint32_t interval_us)
 {
-    float sqr = real * real;
-    float sqi = i * i;
-    float sqj = j * j;
-    float sqk = k * k;
+    imu_module_t *imu = s_active_imu;
+    if (imu == NULL || imu->i2c_dev == NULL) {
+        return ESP_FAIL;
+    }
 
-    float yaw = atan2f(2.0f * (i * j + k * real), (sqi - sqj - sqk + sqr));
-    float pitch = asinf(-2.0f * (i * k - j * real) / (sqi + sqj + sqk + sqr));
-    float roll = atan2f(2.0f * (j * k + i * real), (-sqi - sqj + sqk + sqr));
+    uint8_t packet[21] = {0};
+    bno08x_set_feature_t feature = {
+        .reportId = 0xFD,
+        .featureReportId = SH2_GAME_ROTATION_VECTOR,
+        .flags = 0,
+        .changeSensitivity = 0,
+        .reportInterval_uS = interval_us,
+        .batchInterval_uS = 0,
+        .sensorSpecific = 0,
+    };
 
-    const float rad_to_deg = 57.2957795f;
-    *yaw_deg = yaw * rad_to_deg;
-    *pitch_deg = pitch * rad_to_deg;
-    *roll_deg = roll * rad_to_deg;
+    uint16_t length = (uint16_t)sizeof(packet);
+    packet[0] = (uint8_t)(length & 0xFF);
+    packet[1] = (uint8_t)((length >> 8) & 0x7F);
+    packet[2] = 2U;
+    packet[3] = imu->control_seq++;
+    memcpy(&packet[4], &feature, sizeof(feature));
+
+    if (i2c_master_transmit(imu->i2c_dev, packet, sizeof(packet), IMU_I2C_TIMEOUT_MS) != ESP_OK) {
+        return ESP_FAIL;
+    }
+
+    ESP_LOGI(TAG, "Requested Game Rotation Vector at %u us", (unsigned)interval_us);
+    return ESP_OK;
 }
 
 static int imu_hal_open(sh2_Hal_t *self)
@@ -162,13 +240,31 @@ static int imu_hal_read(sh2_Hal_t *self, uint8_t *pBuffer, unsigned len, uint32_
     uint16_t packet_len = (uint16_t)header[0] | ((uint16_t)header[1] << 8);
     packet_len &= (uint16_t)~0x8000U;
 
-    if (packet_len < 4U || packet_len > len) {
+    if (packet_len < 4U) {
         return 0;
     }
 
-    if (i2c_master_receive(imu->i2c_dev, pBuffer, packet_len, IMU_I2C_TIMEOUT_MS) != ESP_OK) {
+    if (packet_len > len) {
+        uint8_t drain_buf[IMU_MAX_RETRY_DRAIN_BYTES] = {0};
+        size_t remaining = packet_len - sizeof(header);
+        while (remaining > 0) {
+            size_t chunk = remaining > sizeof(drain_buf) ? sizeof(drain_buf) : remaining;
+            if (i2c_master_receive(imu->i2c_dev, drain_buf, chunk, IMU_I2C_TIMEOUT_MS) != ESP_OK) {
+                return 0;
+            }
+            remaining -= chunk;
+        }
         return 0;
     }
+
+    memcpy(pBuffer, header, sizeof(header));
+    if (packet_len > sizeof(header)) {
+        if (i2c_master_receive(imu->i2c_dev, pBuffer + sizeof(header), packet_len - sizeof(header), IMU_I2C_TIMEOUT_MS) != ESP_OK) {
+            return 0;
+        }
+    }
+
+    capture_packet(imu, pBuffer, packet_len);
 
     if (t_us != NULL) {
         *t_us = (uint32_t)esp_timer_get_time();
@@ -227,35 +323,33 @@ static void imu_sensor_callback(void *cookie, sh2_SensorEvent_t *event)
 
 static void imu_log_sample(imu_module_t *imu)
 {
-    if (!imu->have_sample || imu->sensor_value.sensorId != SH2_ARVR_STABILIZED_RV) {
+    if (!imu->packet_ready) {
         return;
     }
 
-    imu->have_sample = false;
+    imu->packet_ready = false;
 
-    float yaw = 0.0f;
-    float pitch = 0.0f;
-    float roll = 0.0f;
-    quaternion_to_euler(
-        imu->sensor_value.un.arvrStabilizedRV.real,
-        imu->sensor_value.un.arvrStabilizedRV.i,
-        imu->sensor_value.un.arvrStabilizedRV.j,
-        imu->sensor_value.un.arvrStabilizedRV.k,
-        &yaw, &pitch, &roll);
+    float pitch_deg = 0.0f;
+    if (!parse_game_rotation_packet(imu->last_packet, imu->last_packet_len, &pitch_deg)) {
+        return;
+    }
+
+    imu->pitch_deg = pitch_deg;
+    imu->pitch_valid = true;
 
     int64_t now_us = esp_timer_get_time();
     int64_t dt_us = (imu->last_print_us == 0) ? 0 : (now_us - imu->last_print_us);
     imu->last_print_us = now_us;
 
-    ESP_LOGI(TAG, "%lld\tacc=%u\tyaw=%.2f\tpitch=%.2f\troll=%.2f",
+    ESP_LOGI(TAG, "%lld\tpitch=%.2f",
              (long long)dt_us,
-             (unsigned)imu->sensor_value.status,
-             yaw, pitch, roll);
+             pitch_deg);
 }
 
 esp_err_t imu_module_init(imu_module_t *imu)
 {
     imu_reset_report_state(imu);
+    s_active_imu = imu;
 
     imu->hal.open = imu_hal_open;
     imu->hal.close = imu_hal_close;
@@ -341,24 +435,11 @@ bool imu_module_probe(imu_module_t *imu, uint32_t timeout_ms)
 
 void imu_module_enable_default_reports(imu_module_t *imu)
 {
-    sh2_SensorConfig_t cfg = {0};
-    cfg.changeSensitivityEnabled = false;
-    cfg.changeSensitivityRelative = false;
-    cfg.wakeupEnabled = false;
-    cfg.alwaysOnEnabled = false;
-    cfg.changeSensitivity = 0;
-    cfg.reportInterval_us = IMU_REPORT_INTERVAL_US;
-    cfg.batchInterval_us = 0;
-    cfg.sensorSpecific = 0;
-
-    int rc = sh2_setSensorConfig(SH2_ARVR_STABILIZED_RV, &cfg);
-    if (rc != SH2_OK) {
-        ESP_LOGE(TAG, "Failed to enable SH2_ARVR_STABILIZED_RV: %d", rc);
-        return;
-    }
-
-    ESP_LOGI(TAG, "Requested ARVR stabilized rotation vector at 200Hz");
     (void)imu;
+    esp_err_t err = bno08x_enable_game_rv(IMU_GAME_RV_INTERVAL_US);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to enable Game Rotation Vector report: %s", esp_err_to_name(err));
+    }
 }
 
 void imu_module_poll_and_log(imu_module_t *imu)
