@@ -66,6 +66,13 @@ env/
 .ccls-cache/
 compile_commands.json
 
+# Editor and test runner state
+.vscode/
+.idea/
+.pytest_cache/
+.coverage
+coverage/
+
 # Windows specific
 Thumbs.db
 ehthumbs.db

@@ -7,8 +7,8 @@ ESP-IDF firmware workspace for a dual-wheel self-balancing robot on ESP32-S3.
 
 Current focus:
 
-- BNO085 SPI bring-up and protocol validation
-- Deterministic startup and interrupt behavior checks
+- BNO08x I2C bring-up using the SH-2 stack
+- Streaming ARVR stabilized rotation vector data as yaw/pitch/roll
 - Control-loop architecture scaffolding for balancing firmware
 
 ## How to build and flash
@@ -18,6 +18,8 @@ Use your existing ESP-IDF setup and run standard commands from the project root:
 - `idf.py set-target esp32s3` (first time only)
 - `idf.py build`
 - `idf.py -p <PORT> flash monitor`
+
+The active application entrypoint is [main/src/main.c](main/src/main.c). It initializes the BNO08x over I2C, probes the sensor, enables the stabilized rotation-vector report, and logs yaw/pitch/roll data.
 
 ## Repository structure
 
@@ -32,11 +34,11 @@ Main files and folders:
 │   ├── CMakeLists.txt
 │   ├── include
 │   ├── src
-│   └── hello_world_main.c
+│   └── third_party
 └── README.md
 ```
 
-Note: `main/hello_world_main.c` is intentionally kept as a legacy test artifact.
+The legacy hello-world entrypoint has been removed. The code under `main/src/hal/` contains the IMU transport layer and SH-2 glue, while `main/src/main.c` drives the current sensor demo.
 
 For ESP-IDF project internals, see the official build system guide:
 [https://docs.espressif.com/projects/esp-idf/en/latest/esp32/api-guides/build-system.html](https://docs.espressif.com/projects/esp-idf/en/latest/esp32/api-guides/build-system.html)
