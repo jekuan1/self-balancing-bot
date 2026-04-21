@@ -9,5 +9,5 @@ idf_component_register(
     INCLUDE_DIRS
         "include"
         "src/third_party/bno08x"
-    REQUIRES driver esp_driver_gpio esp_driver_spi esp_timer
+    REQUIRES driver esp_driver_gpio esp_driver_spi esp_driver_i2c esp_timer
 )

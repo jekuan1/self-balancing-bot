@@ -4,11 +4,25 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include "driver/i2c_master.h"
 #include "esp_err.h"
+#include "sh2_SensorValue.h"
 #include "sh2_hal.h"
 
 typedef struct {
     sh2_Hal_t hal;
+
+    i2c_master_bus_handle_t i2c_bus;
+    i2c_master_dev_handle_t i2c_dev;
+    int i2c_port;
+    int sda_io;
+    int scl_io;
+    int i2c_clock_hz;
+    uint8_t i2c_address;
+    volatile bool reset_seen;
+    volatile bool have_sample;
+    sh2_SensorValue_t sensor_value;
+    int64_t last_print_us;
 
     int spi_host;
     int mosi_io;
