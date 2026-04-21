@@ -19,25 +19,9 @@ static imu_module_t *s_active_imu = NULL;
 #define IMU_I2C_TIMEOUT_MS 1000
 #define IMU_PROBE_READ_RETRY_MS 20
 #define IMU_GAME_RV_INTERVAL_US 5000
-#define IMU_MAX_RETRY_DRAIN_BYTES 64
 #define BNO08X_SENSOR_ADDR 0x4A
 #define BNO08X_ALT_SENSOR_ADDR 0x4B
 #define BNO08X_SOFT_RESET_LEN 5
-
-typedef struct __attribute__((packed)) {
-    uint8_t reportId;
-    uint8_t featureReportId;
-    uint8_t flags;
-    uint16_t changeSensitivity;
-    uint32_t reportInterval_uS;
-    uint32_t batchInterval_uS;
-    uint32_t sensorSpecific;
-} bno08x_set_feature_t;
-
-static uint16_t read_u16_le(const uint8_t *data)
-{
-    return (uint16_t)data[0] | ((uint16_t)data[1] << 8);
-}
 
 static float quat_to_pitch_deg(float real, float i, float j, float k)
 {
@@ -50,35 +34,6 @@ static float quat_to_pitch_deg(float real, float i, float j, float k)
     return pitch * 57.2957795f;
 }
 
-static bool parse_game_rotation_packet(const uint8_t *packet, size_t len, float *pitch_deg)
-{
-    if (len < 21U) {
-        return false;
-    }
-
-    if (packet[2] != 3U || packet[4] != SH2_GAME_ROTATION_VECTOR) {
-        return false;
-    }
-
-    float qi = (float)((int16_t)read_u16_le(&packet[13])) / 16384.0f;
-    float qj = (float)((int16_t)read_u16_le(&packet[15])) / 16384.0f;
-    float qk = (float)((int16_t)read_u16_le(&packet[17])) / 16384.0f;
-    float qreal = (float)((int16_t)read_u16_le(&packet[19])) / 16384.0f;
-
-    *pitch_deg = quat_to_pitch_deg(qreal, qi, qj, qk);
-    return true;
-}
-
-static void capture_packet(imu_module_t *imu, const uint8_t *packet, uint16_t len)
-{
-    if (len > BNO08X_MAX_PACKET_LEN) {
-        len = BNO08X_MAX_PACKET_LEN;
-    }
-
-    memcpy(imu->last_packet, packet, len);
-    imu->last_packet_len = len;
-    imu->packet_ready = true;
-}
 
 static imu_module_t *imu_from_hal(sh2_Hal_t *self)
 {
@@ -169,36 +124,72 @@ static esp_err_t imu_send_soft_reset(imu_module_t *imu)
     return i2c_master_transmit(imu->i2c_dev, reset_pkt, sizeof(reset_pkt), IMU_I2C_TIMEOUT_MS);
 }
 
-esp_err_t bno08x_enable_game_rv(uint32_t interval_us)
+static esp_err_t imu_enable_report(sh2_SensorId_t sensor_id, uint32_t interval_us)
 {
-    imu_module_t *imu = s_active_imu;
-    if (imu == NULL || imu->i2c_dev == NULL) {
-        return ESP_FAIL;
-    }
-
-    uint8_t packet[21] = {0};
-    bno08x_set_feature_t feature = {
-        .reportId = 0xFD,
-        .featureReportId = SH2_GAME_ROTATION_VECTOR,
-        .flags = 0,
+    sh2_SensorConfig_t cfg = {
+        .changeSensitivityEnabled = false,
+        .changeSensitivityRelative = false,
+        .wakeupEnabled = false,
+        .alwaysOnEnabled = false,
         .changeSensitivity = 0,
-        .reportInterval_uS = interval_us,
-        .batchInterval_uS = 0,
+        .reportInterval_us = interval_us,
+        .batchInterval_us = 0,
         .sensorSpecific = 0,
     };
 
-    uint16_t length = (uint16_t)sizeof(packet);
-    packet[0] = (uint8_t)(length & 0xFF);
-    packet[1] = (uint8_t)((length >> 8) & 0x7F);
-    packet[2] = 2U;
-    packet[3] = imu->control_seq++;
-    memcpy(&packet[4], &feature, sizeof(feature));
+    return (sh2_setSensorConfig(sensor_id, &cfg) == SH2_OK) ? ESP_OK : ESP_FAIL;
+}
 
-    if (i2c_master_transmit(imu->i2c_dev, packet, sizeof(packet), IMU_I2C_TIMEOUT_MS) != ESP_OK) {
+esp_err_t bno08x_enable_game_rv(uint32_t interval_us)
+{
+    imu_module_t *imu = s_active_imu;
+    if (imu == NULL) {
+        return ESP_FAIL;
+    }
+
+    if (imu_enable_report(SH2_GAME_ROTATION_VECTOR, interval_us) != ESP_OK) {
         return ESP_FAIL;
     }
 
     ESP_LOGI(TAG, "Requested Game Rotation Vector at %u us", (unsigned)interval_us);
+    return ESP_OK;
+}
+
+esp_err_t bno08x_enable_accelerometer(uint32_t interval_us)
+{
+    imu_module_t *imu = s_active_imu;
+    if (imu == NULL) {
+        return ESP_FAIL;
+    }
+
+    if (imu_enable_report(SH2_ACCELEROMETER, interval_us) != ESP_OK) {
+        return ESP_FAIL;
+    }
+
+    ESP_LOGI(TAG, "Requested Accelerometer at %u us", (unsigned)interval_us);
+    return ESP_OK;
+}
+
+esp_err_t bno08x_enable_all_reports(uint32_t interval_us)
+{
+    const sh2_SensorId_t sensors[] = {
+        SH2_ACCELEROMETER,
+        SH2_GYROSCOPE_CALIBRATED,
+        SH2_MAGNETIC_FIELD_CALIBRATED,
+        SH2_LINEAR_ACCELERATION,
+        SH2_GRAVITY,
+        SH2_ROTATION_VECTOR,
+        SH2_GAME_ROTATION_VECTOR,
+    };
+
+    for (size_t i = 0; i < (sizeof(sensors) / sizeof(sensors[0])); i++) {
+        if (imu_enable_report(sensors[i], interval_us) != ESP_OK) {
+            ESP_LOGE(TAG, "Failed to enable sensor id=0x%02X", sensors[i]);
+            return ESP_FAIL;
+        }
+    }
+
+    ESP_LOGI(TAG, "Requested all primary IMU reports at %u us", (unsigned)interval_us);
     return ESP_OK;
 }
 
@@ -240,31 +231,14 @@ static int imu_hal_read(sh2_Hal_t *self, uint8_t *pBuffer, unsigned len, uint32_
     uint16_t packet_len = (uint16_t)header[0] | ((uint16_t)header[1] << 8);
     packet_len &= (uint16_t)~0x8000U;
 
-    if (packet_len < 4U) {
+    if (packet_len < 4U || packet_len > len) {
         return 0;
     }
 
-    if (packet_len > len) {
-        uint8_t drain_buf[IMU_MAX_RETRY_DRAIN_BYTES] = {0};
-        size_t remaining = packet_len - sizeof(header);
-        while (remaining > 0) {
-            size_t chunk = remaining > sizeof(drain_buf) ? sizeof(drain_buf) : remaining;
-            if (i2c_master_receive(imu->i2c_dev, drain_buf, chunk, IMU_I2C_TIMEOUT_MS) != ESP_OK) {
-                return 0;
-            }
-            remaining -= chunk;
-        }
+    // Match the known-good BNO08x I2C SH-2 read flow.
+    if (i2c_master_receive(imu->i2c_dev, pBuffer, packet_len, IMU_I2C_TIMEOUT_MS) != ESP_OK) {
         return 0;
     }
-
-    memcpy(pBuffer, header, sizeof(header));
-    if (packet_len > sizeof(header)) {
-        if (i2c_master_receive(imu->i2c_dev, pBuffer + sizeof(header), packet_len - sizeof(header), IMU_I2C_TIMEOUT_MS) != ESP_OK) {
-            return 0;
-        }
-    }
-
-    capture_packet(imu, pBuffer, packet_len);
 
     if (t_us != NULL) {
         *t_us = (uint32_t)esp_timer_get_time();
@@ -323,27 +297,25 @@ static void imu_sensor_callback(void *cookie, sh2_SensorEvent_t *event)
 
 static void imu_log_sample(imu_module_t *imu)
 {
-    if (!imu->packet_ready) {
+    if (!imu->have_sample) {
         return;
     }
 
-    imu->packet_ready = false;
-
-    float pitch_deg = 0.0f;
-    if (!parse_game_rotation_packet(imu->last_packet, imu->last_packet_len, &pitch_deg)) {
-        return;
-    }
-
-    imu->pitch_deg = pitch_deg;
-    imu->pitch_valid = true;
+    imu->have_sample = false;
 
     int64_t now_us = esp_timer_get_time();
     int64_t dt_us = (imu->last_print_us == 0) ? 0 : (now_us - imu->last_print_us);
     imu->last_print_us = now_us;
 
-    ESP_LOGI(TAG, "%lld\tpitch=%.2f",
+    if (imu->sensor_value.sensorId != SH2_ACCELEROMETER) {
+        return;
+    }
+
+    ESP_LOGI(TAG, "%lld\tAX=%8.3f\tAY=%8.3f\tAZ=%8.3f",
              (long long)dt_us,
-             pitch_deg);
+             imu->sensor_value.un.accelerometer.x,
+             imu->sensor_value.un.accelerometer.y,
+             imu->sensor_value.un.accelerometer.z);
 }
 
 esp_err_t imu_module_init(imu_module_t *imu)
@@ -436,9 +408,9 @@ bool imu_module_probe(imu_module_t *imu, uint32_t timeout_ms)
 void imu_module_enable_default_reports(imu_module_t *imu)
 {
     (void)imu;
-    esp_err_t err = bno08x_enable_game_rv(IMU_GAME_RV_INTERVAL_US);
+    esp_err_t err = bno08x_enable_all_reports(IMU_GAME_RV_INTERVAL_US);
     if (err != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to enable Game Rotation Vector report: %s", esp_err_to_name(err));
+        ESP_LOGE(TAG, "Failed to enable all IMU reports: %s", esp_err_to_name(err));
     }
 }
 

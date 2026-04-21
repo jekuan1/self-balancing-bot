@@ -7,7 +7,6 @@
 #include "hal/imu_module.h"
 
 static const char *TAG = "i2c_mode_check";
-static const int IMU_HINT_IO = GPIO_NUM_6;
 static TaskHandle_t s_main_task_handle = NULL;
 
 static void imu_hint_isr_handler(void *arg)
@@ -47,7 +46,7 @@ void app_main(void)
     }
 
     gpio_config_t hint_cfg = {
-        .pin_bit_mask = 1ULL << IMU_HINT_IO,
+        .pin_bit_mask = 1ULL << imu.int_io,
         .mode = GPIO_MODE_INPUT,
         .pull_up_en = GPIO_PULLUP_ENABLE,
         .pull_down_en = GPIO_PULLDOWN_DISABLE,
@@ -55,10 +54,10 @@ void app_main(void)
     };
     ESP_ERROR_CHECK(gpio_config(&hint_cfg));
     ESP_ERROR_CHECK(gpio_install_isr_service(ESP_INTR_FLAG_IRAM));
-    ESP_ERROR_CHECK(gpio_isr_handler_add(IMU_HINT_IO, imu_hint_isr_handler, s_main_task_handle));
+    ESP_ERROR_CHECK(gpio_isr_handler_add(imu.int_io, imu_hint_isr_handler, s_main_task_handle));
 
-    if (bno08x_enable_game_rv(5000) != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to enable Game Rotation Vector report");
+    if (bno08x_enable_accelerometer(5000) != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to enable Accelerometer report");
         while (1) {
             vTaskDelay(pdMS_TO_TICKS(500));
         }
@@ -67,7 +66,8 @@ void app_main(void)
     ESP_LOGI(TAG, "BNO085 communication detected through SH-2.");
 
     while (1) {
-        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+        // Fall back to periodic servicing in case HINT edges are missed.
+        (void)ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(20));
         imu_module_poll_and_log(&imu);
     }
 }
