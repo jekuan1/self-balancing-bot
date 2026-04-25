@@ -23,15 +23,31 @@ static imu_module_t *s_active_imu = NULL;
 #define BNO08X_ALT_SENSOR_ADDR 0x4B
 #define BNO08X_SOFT_RESET_LEN 5
 
+static float quat_to_yaw_deg(float real, float i, float j, float k)
+{
+    // Yaw (Z-axis rotation)
+    float yaw = atan2f(2.0f * (real * k + i * j), 1.0f - 2.0f * (j * j + k * k));
+    return yaw * 57.2957795f;
+}
+
 static float quat_to_pitch_deg(float real, float i, float j, float k)
 {
-    float norm = (i * i) + (j * j) + (k * k) + (real * real);
-    if (norm <= 0.0f) {
-        return 0.0f;
+    // Pitch (Y-axis rotation)
+    float sinp = 2.0f * (real * j - i * k);
+    float pitch;
+    if (fabsf(sinp) >= 1.0f) {
+        pitch = copysignf(M_PI / 2.0f, sinp); // Use 90 degrees if out of range
+    } else {
+        pitch = asinf(sinp);
     }
-
-    float pitch = asinf(-2.0f * (i * k - j * real) / norm);
     return pitch * 57.2957795f;
+}
+
+static float quat_to_roll_deg(float real, float i, float j, float k)
+{
+    // Roll (X-axis rotation)
+    float roll = atan2f(2.0f * (real * i + j * k), 1.0f - 2.0f * (i * i + j * j));
+    return roll * 57.2957795f;
 }
 
 
@@ -293,6 +309,14 @@ static void imu_sensor_callback(void *cookie, sh2_SensorEvent_t *event)
 
     imu->sensor_value = temp;
     imu->have_sample = true;
+
+    if (imu->task_to_notify != NULL) {
+        BaseType_t higher_priority_task_woken = pdFALSE;
+        vTaskNotifyGiveFromISR((TaskHandle_t)imu->task_to_notify, &higher_priority_task_woken);
+        if (higher_priority_task_woken == pdTRUE) {
+            portYIELD_FROM_ISR();
+        }
+    }
 }
 
 static void imu_log_sample(imu_module_t *imu)
@@ -303,6 +327,7 @@ static void imu_log_sample(imu_module_t *imu)
 
     imu->have_sample = false;
 
+    /*
     int64_t now_us = esp_timer_get_time();
     int64_t dt_us = (imu->last_print_us == 0) ? 0 : (now_us - imu->last_print_us);
     imu->last_print_us = now_us;
@@ -316,6 +341,7 @@ static void imu_log_sample(imu_module_t *imu)
              imu->sensor_value.un.accelerometer.x,
              imu->sensor_value.un.accelerometer.y,
              imu->sensor_value.un.accelerometer.z);
+    */
 }
 
 esp_err_t imu_module_init(imu_module_t *imu)
@@ -408,9 +434,11 @@ bool imu_module_probe(imu_module_t *imu, uint32_t timeout_ms)
 void imu_module_enable_default_reports(imu_module_t *imu)
 {
     (void)imu;
-    esp_err_t err = bno08x_enable_all_reports(IMU_GAME_RV_INTERVAL_US);
+    // Only enable Game Rotation Vector (Yaw/Pitch/Roll)
+    // 20ms (50Hz) is a reliable rate for I2C polling
+    esp_err_t err = bno08x_enable_game_rv(20000);
     if (err != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to enable all IMU reports: %s", esp_err_to_name(err));
+        ESP_LOGE(TAG, "Failed to enable Game RV report: %s", esp_err_to_name(err));
     }
 }
 
@@ -426,3 +454,47 @@ void imu_module_poll_and_log(imu_module_t *imu)
 
     imu_log_sample(imu);
 }
+
+void imu_module_set_notify_task(imu_module_t *imu, void *task_handle)
+{
+    imu->task_to_notify = task_handle;
+}
+
+esp_err_t imu_module_read_sample(imu_module_t *imu, imu_sample_t *sample)
+{
+    if (imu == NULL || sample == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    sample->timestamp_us = esp_timer_get_time();
+    
+    // Default values
+    sample->roll_deg = 0.0f;
+    sample->pitch_deg = imu->pitch_deg;
+    sample->yaw_deg = 0.0f;
+
+    if (imu->sensor_value.sensorId == SH2_GAME_ROTATION_VECTOR || 
+        imu->sensor_value.sensorId == SH2_ROTATION_VECTOR) {
+        
+        float real = imu->sensor_value.un.gameRotationVector.real;
+        float i = imu->sensor_value.un.gameRotationVector.i;
+        float j = imu->sensor_value.un.gameRotationVector.j;
+        float k = imu->sensor_value.un.gameRotationVector.k;
+
+        sample->yaw_deg = quat_to_yaw_deg(real, i, j, k);
+        sample->pitch_deg = quat_to_pitch_deg(real, i, j, k);
+        sample->roll_deg = quat_to_roll_deg(real, i, j, k);
+        
+        // Zero offset compensation
+        sample->pitch_deg -= imu->tilt_zero_deg;
+
+        // Cache the latest valid values in the imu struct
+        imu->pitch_deg = sample->pitch_deg;
+    } else {
+        // Return latest valid cached pitch if current packet isn't a pose update
+        sample->pitch_deg = imu->pitch_deg;
+    }
+
+    return ESP_OK;
+}
+

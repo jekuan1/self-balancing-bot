@@ -18,6 +18,9 @@ typedef struct {
 } imu_sample_t;
 
 typedef struct {
+    float yaw_deg;
+    float pitch_deg;
+    float roll_deg;
     float tilt_deg;
     float tilt_rate_dps;
     int64_t timestamp_us;

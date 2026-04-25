@@ -9,6 +9,9 @@ void state_estimator_init(state_estimator_t *estimator)
 
 void state_estimator_update(state_estimator_t *estimator, const imu_sample_t *sample, robot_pose_t *out_pose)
 {
+    out_pose->yaw_deg = sample->yaw_deg;
+    out_pose->pitch_deg = sample->pitch_deg;
+    out_pose->roll_deg = sample->roll_deg;
     out_pose->tilt_deg = sample->pitch_deg;
     out_pose->timestamp_us = sample->timestamp_us;
 
