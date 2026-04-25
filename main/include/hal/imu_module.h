@@ -8,6 +8,7 @@
 #include "esp_err.h"
 #include "sh2_SensorValue.h"
 #include "sh2_hal.h"
+#include "robot_types.h"
 
 #define BNO08X_MAX_PACKET_LEN 512
 
@@ -31,6 +32,7 @@ typedef struct {
     float pitch_deg;
     bool pitch_valid;
     uint8_t control_seq;
+    float tilt_zero_deg;
 
     int spi_host;
     int mosi_io;
@@ -46,6 +48,7 @@ typedef struct {
 
     void *spi_dev;
     volatile uint32_t isr_count;
+    void *task_to_notify;
 } imu_module_t;
 
 esp_err_t imu_module_init(imu_module_t *imu);
@@ -55,5 +58,8 @@ esp_err_t bno08x_enable_accelerometer(uint32_t interval_us);
 esp_err_t bno08x_enable_all_reports(uint32_t interval_us);
 void imu_module_enable_default_reports(imu_module_t *imu);
 void imu_module_poll_and_log(imu_module_t *imu);
+
+esp_err_t imu_module_read_sample(imu_module_t *imu, imu_sample_t *sample);
+void imu_module_set_notify_task(imu_module_t *imu, void *task_handle);
 
 #endif
