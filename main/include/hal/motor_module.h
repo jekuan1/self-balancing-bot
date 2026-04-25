@@ -4,6 +4,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include "driver/gpio.h"
+#include "esp_err.h"
 #include "robot_types.h"
 
 typedef struct {
@@ -27,5 +28,20 @@ void motor_module_init(motor_module_t *motor);
 void motor_module_set_enabled(motor_module_t *motor, bool enable);
 void motor_module_apply_command(motor_module_t *motor, const motor_command_t *command);
 void motor_module_service_step_pulses(motor_module_t *motor, int64_t now_us);
+
+esp_err_t motor_module_tmc2240_spi_init(int spi_host,
+                                        int sclk_pin,
+                                        int mosi_pin,
+                                        int miso_pin,
+                                        int cs_pin,
+                                        int ain_pin,
+                                        int spi_clock_hz);
+esp_err_t motor_module_tmc2240_write_reg(uint8_t reg_addr, uint32_t value);
+esp_err_t motor_module_tmc2240_read_reg(uint8_t reg_addr, uint32_t *value_out);
+void motor_module_tmc2240_test_log(void);
+void motor_module_tmc2240_configure(void);
+void motor_module_tmc2240_configure_robot_mode(void);
+esp_err_t motor_module_tmc2240_get_temp(float *temp_c);
+esp_err_t motor_module_tmc2240_get_current_scaling(uint8_t *cs_actual);
 
 #endif

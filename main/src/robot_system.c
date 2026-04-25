@@ -144,14 +144,14 @@ void robot_system_start(void)
     g_robot.imu.int_io = 4;
     g_robot.imu.tilt_zero_deg = 0.0f;
 
-    g_robot.motor.left.step_pin = 12;
-    g_robot.motor.left.dir_pin = 13;
-    g_robot.motor.left.en_pin = 14;
+    g_robot.motor.left.step_pin = 8;
+    g_robot.motor.left.dir_pin = 18;
+    g_robot.motor.left.en_pin = 17;
     g_robot.motor.left.en_active_low = true;
 
-    g_robot.motor.right.step_pin = 15;
-    g_robot.motor.right.dir_pin = 16;
-    g_robot.motor.right.en_pin = 17;
+    g_robot.motor.right.step_pin = 8;  // Mirrored for single-motor test
+    g_robot.motor.right.dir_pin = 18; // Mirrored for single-motor test
+    g_robot.motor.right.en_pin = 17;  // Shared EN pin
     g_robot.motor.right.en_active_low = true;
 
     g_robot.motor.max_step_hz = 2500.0f;
