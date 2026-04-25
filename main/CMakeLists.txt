@@ -1,7 +1,16 @@
 idf_component_register(
     SRCS
         "src/main.c"
+        "src/robot_system.c"
         "src/hal/imu_module.c"
+        "src/hal/motor_module.c"
+        "src/hal/safety_watchdog.c"
+        "src/hal/wifi_module.c"
+        "src/control/pid_controller.c"
+        "src/control/state_estimator.c"
+        "src/supervisor/command_parser.c"
+        "src/supervisor/parameter_manager.c"
+        "src/supervisor/telemetry_comms.c"
         "src/third_party/bno08x/sh2.c"
         "src/third_party/bno08x/sh2_SensorValue.c"
         "src/third_party/bno08x/sh2_util.c"
@@ -9,5 +18,5 @@ idf_component_register(
     INCLUDE_DIRS
         "include"
         "src/third_party/bno08x"
-    REQUIRES driver esp_driver_gpio esp_driver_spi esp_driver_i2c esp_timer
+    REQUIRES driver esp_driver_gpio esp_driver_spi esp_driver_i2c esp_timer nvs_flash esp_wifi esp_event esp_netif lwip
 )
