@@ -58,7 +58,7 @@ esp_err_t wifi_module_init_ap(const char *ssid, const char *password)
 
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_AP));
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &wifi_config));
-    ESP_ERROR_CHECK(esp_wifi_start());
+    ESP_ERROR_CHECK(esp_wifi_start());  
 
     ESP_LOGI(TAG, "WiFi Access Point started. SSID: %s", ssid);
     return ESP_OK;
