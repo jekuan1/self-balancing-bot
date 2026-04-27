@@ -14,18 +14,11 @@ void state_estimator_update(state_estimator_t *estimator, const imu_sample_t *sa
     out_pose->roll_deg = sample->roll_deg;
     out_pose->tilt_deg = sample->pitch_deg;
     out_pose->timestamp_us = sample->timestamp_us;
-
-    if (!estimator->initialized || estimator->last_ts_us == 0) {
-        out_pose->tilt_rate_dps = 0.0f;
-        estimator->initialized = true;
-    } else {
-        float dt_s = (float)(sample->timestamp_us - estimator->last_ts_us) / 1000000.0f;
-        if (dt_s <= 0.0f) {
-            dt_s = 0.001f;
-        }
-        out_pose->tilt_rate_dps = (sample->pitch_deg - estimator->last_tilt_deg) / dt_s;
-    }
+    
+    // Direct usage of gyro for tilt rate - much cleaner than differentiation
+    out_pose->tilt_rate_dps = sample->gyro_pitch_dps;
 
     estimator->last_tilt_deg = sample->pitch_deg;
     estimator->last_ts_us = sample->timestamp_us;
+    estimator->initialized = true;
 }

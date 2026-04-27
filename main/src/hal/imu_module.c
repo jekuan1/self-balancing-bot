@@ -58,13 +58,12 @@ static imu_module_t *imu_from_hal(sh2_Hal_t *self)
 
 static void imu_reset_report_state(imu_module_t *imu)
 {
-    imu->reset_seen = false;
-    imu->have_sample = false;
-    imu->last_print_us = 0;
-    imu->packet_ready = false;
-    imu->last_packet_len = 0;
+    imu->yaw_deg = 0.0f;
     imu->pitch_deg = 0.0f;
-    imu->pitch_valid = false;
+    imu->roll_deg = 0.0f;
+    imu->gyro_pitch_dps = 0.0f;
+    imu->orientation_valid = false;
+    imu->gyro_valid = false;
     imu->control_seq = 0;
     memset((void *)&imu->sensor_value, 0, sizeof(imu->sensor_value));
 }
@@ -169,6 +168,21 @@ esp_err_t bno08x_enable_game_rv(uint32_t interval_us)
 
     ESP_LOGI(TAG, "Requested Game Rotation Vector at %u us", (unsigned)interval_us);
     return ESP_OK;
+}
+
+esp_err_t bno08x_enable_gyroscope(uint32_t interval_us)
+{
+    sh2_SensorConfig_t config;
+    config.changeSensitivityEnabled = false;
+    config.wakeupEnabled = false;
+    config.changeSensitivityRelative = false;
+    config.alwaysOnEnabled = false;
+    config.changeSensitivity = 0;
+    config.reportInterval_us = interval_us;
+    config.batchInterval_us = 0;
+
+    int rc = sh2_setSensorConfig(SH2_GYROSCOPE_CALIBRATED, &config);
+    return (rc == SH2_OK) ? ESP_OK : ESP_FAIL;
 }
 
 esp_err_t bno08x_enable_accelerometer(uint32_t interval_us)
@@ -303,11 +317,31 @@ static void imu_sensor_callback(void *cookie, sh2_SensorEvent_t *event)
     imu->isr_count++;
 
     if (sh2_decodeSensorEvent(&temp, event) != SH2_OK) {
-        ESP_LOGI(TAG, "Report id=0x%02X len=%u", event->reportId, event->len);
         return;
     }
 
-    imu->sensor_value = temp;
+    if (temp.sensorId == SH2_GAME_ROTATION_VECTOR) {
+        imu->yaw_deg = quat_to_yaw_deg(temp.un.gameRotationVector.real,
+                                      temp.un.gameRotationVector.i,
+                                      temp.un.gameRotationVector.j,
+                                      temp.un.gameRotationVector.k);
+        imu->pitch_deg = quat_to_pitch_deg(temp.un.gameRotationVector.real,
+                                          temp.un.gameRotationVector.i,
+                                          temp.un.gameRotationVector.j,
+                                          temp.un.gameRotationVector.k);
+        imu->roll_deg = quat_to_roll_deg(temp.un.gameRotationVector.real,
+                                        temp.un.gameRotationVector.i,
+                                        temp.un.gameRotationVector.j,
+                                        temp.un.gameRotationVector.k);
+        imu->orientation_valid = true;
+    } else if (temp.sensorId == SH2_GYROSCOPE_CALIBRATED) {
+        // Since the IMU is mounted vertically for balancing, 
+        // the gyro axis we care about depends on mounting.
+        // Assuming pitch is around X or Y. 
+        imu->gyro_pitch_dps = temp.un.gyroscope.y * 57.2957795f; 
+        imu->gyro_valid = true;
+    }
+
     imu->have_sample = true;
 
     if (imu->task_to_notify != NULL) {
@@ -434,12 +468,12 @@ bool imu_module_probe(imu_module_t *imu, uint32_t timeout_ms)
 void imu_module_enable_default_reports(imu_module_t *imu)
 {
     (void)imu;
-    // Only enable Game Rotation Vector (Yaw/Pitch/Roll)
-    // 20ms (50Hz) is a reliable rate for I2C polling
-    esp_err_t err = bno08x_enable_game_rv(20000);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to enable Game RV report: %s", esp_err_to_name(err));
-    }
+    // Enable Game Rotation Vector (Yaw/Pitch/Roll) + Calibrated Gyro
+    // 10ms (100Hz) is better for balancing if I2C holds up. 
+    // Starting with 20ms (50Hz) for stability.
+    uint32_t interval = 20000;
+    (void)bno08x_enable_game_rv(interval);
+    (void)bno08x_enable_gyroscope(interval);
 }
 
 void imu_module_poll_and_log(imu_module_t *imu)
@@ -466,35 +500,12 @@ esp_err_t imu_module_read_sample(imu_module_t *imu, imu_sample_t *sample)
         return ESP_ERR_INVALID_ARG;
     }
 
+    sample->yaw_deg = imu->yaw_deg;
+    sample->pitch_deg = imu->pitch_deg - imu->tilt_zero_deg;
+    sample->roll_deg = imu->roll_deg;
+    sample->gyro_pitch_dps = imu->gyro_pitch_dps;
     sample->timestamp_us = esp_timer_get_time();
-    
-    // Default values
-    sample->roll_deg = 0.0f;
-    sample->pitch_deg = imu->pitch_deg;
-    sample->yaw_deg = 0.0f;
 
-    if (imu->sensor_value.sensorId == SH2_GAME_ROTATION_VECTOR || 
-        imu->sensor_value.sensorId == SH2_ROTATION_VECTOR) {
-        
-        float real = imu->sensor_value.un.gameRotationVector.real;
-        float i = imu->sensor_value.un.gameRotationVector.i;
-        float j = imu->sensor_value.un.gameRotationVector.j;
-        float k = imu->sensor_value.un.gameRotationVector.k;
-
-        sample->yaw_deg = quat_to_yaw_deg(real, i, j, k);
-        sample->pitch_deg = quat_to_pitch_deg(real, i, j, k);
-        sample->roll_deg = quat_to_roll_deg(real, i, j, k);
-        
-        // Zero offset compensation
-        sample->pitch_deg -= imu->tilt_zero_deg;
-
-        // Cache the latest valid values in the imu struct
-        imu->pitch_deg = sample->pitch_deg;
-    } else {
-        // Return latest valid cached pitch if current packet isn't a pose update
-        sample->pitch_deg = imu->pitch_deg;
-    }
-
-    return ESP_OK;
+    return imu->orientation_valid ? ESP_OK : ESP_ERR_INVALID_STATE;
 }
 

@@ -38,6 +38,10 @@ float pid_controller_step(pid_controller_t *pid, float setpoint, float measureme
     }
 
     pid->integrator += error * dt_s;
+    
+    // Anti-windup: clamp the integrator to prevent runaway
+    pid->integrator = clampf(pid->integrator, pid->out_min / (pid->ki > 0 ? pid->ki : 1.0f), pid->out_max / (pid->ki > 0 ? pid->ki : 1.0f));
+
     float derivative = (error - pid->prev_error) / dt_s;
 
     float output = (pid->kp * error) + (pid->ki * pid->integrator) + (pid->kd * derivative);

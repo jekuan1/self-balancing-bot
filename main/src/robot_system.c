@@ -58,50 +58,33 @@ static void control_task_fn(void *arg)
     imu_sample_t sample;
 
     for (;;) {
-        ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(20));
+        ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(10));
+
+        // Process incoming IMU data (Service BNO08x without logging)
+        sh2_service();
 
         int64_t now_us = esp_timer_get_time();
-        (void)imu_module_read_sample(&sys->imu, &sample);
-        state_estimator_update(&sys->estimator, &sample, &sys->pose);
+        if (imu_module_read_sample(&sys->imu, &sample) == ESP_OK) {
+            state_estimator_update(&sys->estimator, &sample, &sys->pose);
+        }
 
         if (safety_watchdog_is_tripped(&sys->watchdog)) {
             robot_emergency_stop(sys, "driver DIAG asserted");
         }
 
+        /* Temporary Disability for Testing
         if (fabsf(sys->pose.tilt_deg) > sys->failure_tilt_limit_deg) {
             robot_emergency_stop(sys, "tilt exceeded failure threshold");
         }
+        */
 
-        if (sys->state == ROBOT_STATE_LOCKED && fabsf(sys->pose.tilt_deg) <= sys->ready_tilt_limit_deg) {
-            motor_module_set_enabled(&sys->motor, true);
-            pid_controller_reset(&sys->pid);
-            taskENTER_CRITICAL(&sys->lock);
-            sys->state = ROBOT_STATE_READY;
-            taskEXIT_CRITICAL(&sys->lock);
-            ESP_LOGI(TAG, "Robot state -> READY");
-        }
-
-        if (sys->state == ROBOT_STATE_READY) {
-            control_setpoint_t setpoint_copy;
-            taskENTER_CRITICAL(&sys->lock);
-            setpoint_copy = sys->setpoint;
-            taskEXIT_CRITICAL(&sys->lock);
-
-            float balance_output = pid_controller_step(
-                &sys->pid,
-                setpoint_copy.tilt_setpoint_deg,
-                sys->pose.tilt_deg,
-                now_us);
-
-            motor_command_t cmd = {
-                .left_step_hz = balance_output - setpoint_copy.turn_rate,
-                .right_step_hz = balance_output + setpoint_copy.turn_rate,
-            };
-            motor_module_apply_command(&sys->motor, &cmd);
-        } else {
-            motor_command_t cmd = {0};
-            motor_module_apply_command(&sys->motor, &cmd);
-        }
+        // Temporary Open-Loop Motor Test (Ignore PID)
+        motor_module_set_enabled(&sys->motor, true);
+        motor_command_t cmd = {
+            .left_step_hz = 500.0f,
+            .right_step_hz = 500.0f,
+        };
+        motor_module_apply_command(&sys->motor, &cmd);
 
         motor_module_service_step_pulses(&sys->motor, now_us);
     }
@@ -128,7 +111,10 @@ static void supervisor_task_fn(void *arg)
 
         telemetry_comms_publish(&sys->telemetry, state_copy, &pose_copy);
 
-        vTaskDelay(pdMS_TO_TICKS(20));
+        // Periodically log motor SPI status for debugging
+        motor_module_tmc2240_test_log();
+
+        vTaskDelay(pdMS_TO_TICKS(1000));
     }
 }
 
@@ -141,23 +127,33 @@ void robot_system_start(void)
     g_robot.failure_tilt_limit_deg = 60.0f;
     g_robot.state = ROBOT_STATE_LOCKED;
 
-    g_robot.imu.int_io = 4;
+    // 1. IMU Configuration (BNO085)
+    g_robot.imu.sda_io = 5;
+    g_robot.imu.scl_io = 4;
+    g_robot.imu.i2c_port = I2C_NUM_0;
+    g_robot.imu.i2c_clock_hz = 100000;
+    g_robot.imu.i2c_address = 0x4B; 
+    g_robot.imu.int_io = -1; // Interrupt not used in current poll-driven mode
     g_robot.imu.tilt_zero_deg = 0.0f;
 
+    // 2. Motor Configuration (TMC2240)
+    // Left Motor Pins
     g_robot.motor.left.step_pin = 8;
-    g_robot.motor.left.dir_pin = 18;
+    g_robot.motor.left.dir_pin = 11;
     g_robot.motor.left.en_pin = 17;
     g_robot.motor.left.en_active_low = true;
 
-    g_robot.motor.right.step_pin = 8;  // Mirrored for single-motor test
-    g_robot.motor.right.dir_pin = 18; // Mirrored for single-motor test
-    g_robot.motor.right.en_pin = 17;  // Shared EN pin
+    // Right Motor Pins
+    g_robot.motor.right.step_pin = 20; 
+    g_robot.motor.right.dir_pin = 19; 
+    g_robot.motor.right.en_pin = 17; 
     g_robot.motor.right.en_active_low = true;
 
-    g_robot.motor.max_step_hz = 2500.0f;
+    g_robot.motor.max_step_hz = 5000.0f;
 
-    g_robot.watchdog.diag_left_io = 5;
-    g_robot.watchdog.diag_right_io = 6;
+    // 3. Watchdog (DIAG) Configuration
+    g_robot.watchdog.diag_left_io = 6; 
+    g_robot.watchdog.diag_right_io = 41;
 
     parameter_manager_init();
 
@@ -173,9 +169,23 @@ void robot_system_start(void)
     command_parser_init(&g_robot.parser);
     telemetry_comms_init(&g_robot.telemetry);
 
-    motor_module_init(&g_robot.motor);
-    safety_watchdog_init(&g_robot.watchdog);
+    // 4. Initialize Hardware Modules
     imu_module_init(&g_robot.imu);
+    imu_module_enable_default_reports(&g_robot.imu);
+    
+    motor_module_init(&g_robot.motor);
+    
+    // ISOLATION TEST: Only initializing the LEFT motor (CS=9)
+    // Right motor (CS=39) is kept HIGH to deselect it
+    gpio_set_level(39, 1); 
+    motor_module_tmc2240_spi_init(1, 16, 15, 10, 9, -1, 50000);
+    motor_module_tmc2240_configure_robot_mode();
+    motor_module_tmc2240_test_log();
+
+    // Force EN pin low (Active)
+    gpio_set_level(17, 0);
+
+    safety_watchdog_init(&g_robot.watchdog);
 
     g_robot.setpoint.drive_velocity = 0.0f;
     g_robot.setpoint.turn_rate = 0.0f;
