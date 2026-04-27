@@ -46,10 +46,12 @@ void telemetry_comms_publish(telemetry_comms_t *telemetry, robot_state_t state, 
 
     // 2. Send over UDP
     if (s_udp_sock >= 0) {
+        /*
         char payload[64];
         int len = snprintf(payload, sizeof(payload), "%.2f,%.2f,%.2f\n", 
                            pose->yaw_deg, pose->pitch_deg, pose->roll_deg);
         
         sendto(s_udp_sock, payload, len, 0, (struct sockaddr *)&s_dest_addr, sizeof(s_dest_addr));
+        */
     }
 }

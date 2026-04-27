@@ -14,6 +14,7 @@ typedef struct {
     float roll_deg;
     float pitch_deg;
     float yaw_deg;
+    float gyro_pitch_dps;
     int64_t timestamp_us;
 } imu_sample_t;
 

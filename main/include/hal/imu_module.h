@@ -29,8 +29,12 @@ typedef struct {
     uint8_t last_packet[BNO08X_MAX_PACKET_LEN];
     uint16_t last_packet_len;
     volatile bool packet_ready;
+    float yaw_deg;
     float pitch_deg;
-    bool pitch_valid;
+    float roll_deg;
+    float gyro_pitch_dps;
+    bool orientation_valid;
+    bool gyro_valid;
     uint8_t control_seq;
     float tilt_zero_deg;
 
@@ -54,6 +58,7 @@ typedef struct {
 esp_err_t imu_module_init(imu_module_t *imu);
 bool imu_module_probe(imu_module_t *imu, uint32_t timeout_ms);
 esp_err_t bno08x_enable_game_rv(uint32_t interval_us);
+esp_err_t bno08x_enable_gyroscope(uint32_t interval_us);
 esp_err_t bno08x_enable_accelerometer(uint32_t interval_us);
 esp_err_t bno08x_enable_all_reports(uint32_t interval_us);
 void imu_module_enable_default_reports(imu_module_t *imu);

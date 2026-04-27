@@ -34,14 +34,16 @@ esp_err_t motor_module_tmc2240_spi_init(int spi_host,
                                         int mosi_pin,
                                         int miso_pin,
                                         int cs_pin,
-                                        int ain_pin,
                                         int spi_clock_hz);
+esp_err_t motor_module_tmc2240_right_spi_init(int spi_host,
+                                              int sclk_pin,
+                                              int mosi_pin,
+                                              int miso_pin,
+                                              int cs_pin,
+                                              int spi_clock_hz);
 esp_err_t motor_module_tmc2240_write_reg(uint8_t reg_addr, uint32_t value);
 esp_err_t motor_module_tmc2240_read_reg(uint8_t reg_addr, uint32_t *value_out);
 void motor_module_tmc2240_test_log(void);
-void motor_module_tmc2240_configure(void);
-void motor_module_tmc2240_configure_robot_mode(void);
-esp_err_t motor_module_tmc2240_get_temp(float *temp_c);
-esp_err_t motor_module_tmc2240_get_current_scaling(uint8_t *cs_actual);
+void motor_module_tmc2240_right_test_log(void);
 
 #endif
