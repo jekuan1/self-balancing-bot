@@ -100,7 +100,7 @@ static esp_err_t imu_i2c_bus_init(imu_module_t *imu)
         .scl_io_num = imu->scl_io,
         .clk_source = I2C_CLK_SRC_DEFAULT,
         .glitch_ignore_cnt = 7,
-        .flags.enable_internal_pullup = true,
+        .flags.enable_internal_pullup = false,
     };
 
     return i2c_new_master_bus(&bus_config, &imu->i2c_bus);
