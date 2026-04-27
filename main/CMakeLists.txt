@@ -1,7 +1,6 @@
 idf_component_register(
     SRCS
         "src/main.c"
-        "src/robot_system.c"
         "src/hal/imu_module.c"
         "src/hal/motor_module.c"
         "src/hal/safety_watchdog.c"
