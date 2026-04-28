@@ -45,5 +45,6 @@ esp_err_t motor_module_tmc2240_write_reg(uint8_t reg_addr, uint32_t value);
 esp_err_t motor_module_tmc2240_read_reg(uint8_t reg_addr, uint32_t *value_out);
 void motor_module_tmc2240_test_log(void);
 void motor_module_tmc2240_right_test_log(void);
+void motor_module_tmc2240_configure_robot_mode(void);
 
 #endif

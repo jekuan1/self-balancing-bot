@@ -9,7 +9,7 @@
 #include "hal/imu_module.h"
 #include "hal/motor_module.h"
 
-static const char *TAG = "i2c_mode_check";
+static const char *TAG = "motor_test";
 static TaskHandle_t s_main_task_handle = NULL;
 
 // TMC2240 SPI test wiring (adjust to your board).
