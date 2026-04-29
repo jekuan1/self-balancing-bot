@@ -24,6 +24,16 @@ typedef struct {
     float max_step_hz;
 } motor_module_t;
 
+typedef struct {
+    uint16_t run_current_ma;
+    uint16_t hold_current_ma;
+    uint16_t microsteps;
+    bool interpolate;
+    uint32_t stealth_threshold;
+    int8_t stall_sensitivity;
+    bool cool_step_enabled;
+} TMC2240_RobotConfig_t;
+
 void motor_module_init(motor_module_t *motor);
 void motor_module_set_enabled(motor_module_t *motor, bool enable);
 void motor_module_apply_command(motor_module_t *motor, const motor_command_t *command);
@@ -45,6 +55,6 @@ esp_err_t motor_module_tmc2240_write_reg(uint8_t reg_addr, uint32_t value);
 esp_err_t motor_module_tmc2240_read_reg(uint8_t reg_addr, uint32_t *value_out);
 void motor_module_tmc2240_test_log(void);
 void motor_module_tmc2240_right_test_log(void);
-void motor_module_tmc2240_configure_robot_mode(void);
+void motor_module_tmc2240_configure_robot_mode(const TMC2240_RobotConfig_t *config);
 
 #endif

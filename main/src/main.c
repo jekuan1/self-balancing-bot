@@ -75,10 +75,11 @@ void app_main(void)
         ESP_LOGE(TAG, "RIGHT TMC2240 SPI init failed");
     }
 
-    // Configure motors with CHOPCONF, current, and other settings
-    motor_module_tmc2240_configure_robot_mode();
+    // Configure motors with CHOPCONF, current, and other settings.
+    // NULL => use default config inside motor_module.
+    motor_module_tmc2240_configure_robot_mode(NULL);
 
-    // 3. Initialize Motor HAL with step/dir test
+    // 3. Initialize Motor HAL for SPI-only testing (motors stay disabled)
     static motor_module_t motor_hal = {0};
     motor_hal.left.step_pin = TMC_LEFT_STEP;
     motor_hal.left.dir_pin = TMC_LEFT_DIR;
@@ -93,32 +94,14 @@ void app_main(void)
     motor_hal.max_step_hz = 5000.0f;
     
     motor_module_init(&motor_hal);
-    motor_module_set_enabled(&motor_hal, true);
-    ESP_LOGI(TAG, "Motor testing enabled; spinning at ~0.1 RPM.");
-
-    // Test command: 1000 Hz step rate
-    static motor_command_t test_cmd = {.left_step_hz = 1000.0f, .right_step_hz = 1000.0f};
+    motor_module_set_enabled(&motor_hal, false);
+    ESP_LOGI(TAG, "SPI-only test enabled; motors remain disabled.");
 
     int64_t last_tmc_log_us = 0;
-    int64_t startup_time_us = esp_timer_get_time();
-    bool motors_stopped = false;
     
     while (1) {
         imu_module_poll_and_log(&imu);
         int64_t now_us = esp_timer_get_time();
-        int64_t elapsed_us = now_us - startup_time_us;
-
-        // Stop motors after 10 seconds
-        if (elapsed_us >= 10000000 && !motors_stopped) {
-            motor_module_set_enabled(&motor_hal, false);
-            ESP_LOGI(TAG, "Motor test complete; motors disabled.");
-            motors_stopped = true;
-        }
-
-        // Apply direction command first (ensure DIR signal stable before STEP)
-        motor_module_apply_command(&motor_hal, &test_cmd);
-        // Service motor step pulses every loop
-        motor_module_service_step_pulses(&motor_hal, now_us);
 
         // Log TMC temperature every 1 second
         if ((now_us - last_tmc_log_us) >= 1000000) {
