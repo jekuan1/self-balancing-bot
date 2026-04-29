@@ -41,17 +41,17 @@ void telemetry_comms_publish(telemetry_comms_t *telemetry, robot_state_t state, 
     }
     telemetry->last_publish_us = now_us;
 
-    // 1. Log to console as before
-    ESP_LOGD(TAG, "Y=%.2f P=%.2f R=%.2f", pose->yaw_deg, pose->pitch_deg, pose->roll_deg);
+    // Log to console
+    // ESP_LOGD(TAG, "Y=%.2f P=%.2f R=%.2f", pose->yaw_deg, pose->pitch_deg, pose->roll_deg);
 
-    // 2. Send over UDP
+    // Send data over UDP
     if (s_udp_sock >= 0) {
-        /*
+        // Simple CSV format: "timestamp_us,yaw,tilt,tilt_rate\n"
         char payload[64];
-        int len = snprintf(payload, sizeof(payload), "%.2f,%.2f,%.2f\n", 
-                           pose->yaw_deg, pose->pitch_deg, pose->roll_deg);
+        int len = snprintf(payload, sizeof(payload), "%" PRId64 ",%.2f,%.2f,%.2f\n", 
+                           pose->timestamp_us, pose->yaw_deg, pose->tilt_deg, pose->tilt_rate_dps);
         
         sendto(s_udp_sock, payload, len, 0, (struct sockaddr *)&s_dest_addr, sizeof(s_dest_addr));
-        */
+
     }
 }
