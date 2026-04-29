@@ -275,16 +275,17 @@ static void tmc2240_miso_sanity_check_once(tmc2240_spi_ctx_t *ctx)
 
     gpio_set_pull_mode(ctx->miso_pin, GPIO_PULLDOWN_ONLY);
 
-    // Count byte differences between PD and PU reads.
-    int diff_count = 0;
-    for (int i = 0; i < 5; ++i) {
-        if (rx_pd[i] != rx_pu[i]) ++diff_count;
+    // Byte 0 is the SPI status response and can legitimately differ between
+    // back-to-back frames; compare payload bytes only for floating-MISO checks.
+    int payload_diff_count = 0;
+    for (int i = 1; i < 5; ++i) {
+        if (rx_pd[i] != rx_pu[i]) ++payload_diff_count;
     }
 
     // Only warn if the received frames actually differ; a sole GPIO-level
     // change is noisy on some platforms and doesn't indicate bus corruption
     // if the frame bytes are identical.
-    if (diff_count > 0) {
+    if (payload_diff_count > 0) {
         ESP_LOGW(TAG,
                  "%s MISO sanity: gpio_level PD=%d PU=%d | PD=%02X %02X %02X %02X %02X | PU=%02X %02X %02X %02X %02X",
                  ctx->label,
@@ -297,7 +298,7 @@ static void tmc2240_miso_sanity_check_once(tmc2240_spi_ctx_t *ctx)
                  ctx->label);
     } else {
         ESP_LOGD(TAG,
-                 "%s MISO sanity: gpio levels PD=%d PU=%d but frames identical; suppressing warning.",
+                 "%s MISO sanity: payload bytes stable across pulls; suppressing warning.",
                  ctx->label, miso_level_pd, miso_level_pu);
     }
 }
@@ -621,17 +622,21 @@ void motor_module_tmc2240_configure_robot_mode(const TMC2240_RobotConfig_t *conf
     for (int i = 0; i < 2; i++) {
         tmc2240_spi_ctx_t *ctx = ctxs[i];
         if (!ctx->initialized) continue;
-        uint8_t gstat = 0;
-        uint8_t tx_gstat[5] = {0x01, 0, 0, 0, 0}; // GSTAT (Read)
-        uint8_t rx_gstat[5] = {0};
-        tmc2240_transfer_40b_ctx(ctx, tx_gstat, rx_gstat);
-        gstat = rx_gstat[4];
+        uint32_t gstat_u32 = 0;
+        uint32_t drv_status = 0;
+        esp_err_t gerr = tmc2240_read_reg_u32_ctx(ctx, 0x01, &gstat_u32);   // GSTAT
+        esp_err_t derr = tmc2240_read_reg_u32_ctx(ctx, 0x6F, &drv_status);  // DRV_STATUS
+        uint8_t gstat = (uint8_t)(gstat_u32 & 0xFFU);
+
+        if (gerr != ESP_OK || derr != ESP_OK) {
+            ESP_LOGW(TAG,
+                     "%s TMC2240 status read failed (GSTAT=%s, DRV_STATUS=%s)",
+                     ctx->label,
+                     esp_err_to_name(gerr),
+                     esp_err_to_name(derr));
+        }
 
         uint8_t rx_data[5] = {0};
-        uint8_t tx_status[5] = {0x6F, 0, 0, 0, 0}; // DRV_STATUS (Read)
-        tmc2240_transfer_40b_ctx(ctx, tx_status, rx_data);
-        uint32_t drv_status = ((uint32_t)rx_data[1] << 24) | ((uint32_t)rx_data[2] << 16) | 
-                             ((uint32_t)rx_data[3] << 8) | (uint32_t)rx_data[4];
 
         char gstat_text[48];
         char drv_text[96];

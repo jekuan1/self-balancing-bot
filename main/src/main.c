@@ -79,7 +79,7 @@ void app_main(void)
     // NULL => use default config inside motor_module.
     motor_module_tmc2240_configure_robot_mode(NULL);
 
-    // 3. Initialize Motor HAL for SPI-only testing (motors stay disabled)
+    // 3. Initialize Motor HAL for movement testing
     static motor_module_t motor_hal = {0};
     motor_hal.left.step_pin = TMC_LEFT_STEP;
     motor_hal.left.dir_pin = TMC_LEFT_DIR;
@@ -91,17 +91,46 @@ void app_main(void)
     motor_hal.right.en_pin = TMC_EN;
     motor_hal.right.en_active_low = true;
 
-    motor_hal.max_step_hz = 5000.0f;
+    motor_hal.max_step_hz = 2000.0f;
     
     motor_module_init(&motor_hal);
-    motor_module_set_enabled(&motor_hal, false);
-    ESP_LOGI(TAG, "SPI-only test enabled; motors remain disabled.");
+    motor_module_set_enabled(&motor_hal, true);
+
+    motor_command_t test_cmd = {
+        .left_step_hz = 300.0f,
+        .right_step_hz = 300.0f,
+    };
+    motor_module_apply_command(&motor_hal, &test_cmd);
+    ESP_LOGI(TAG, "Motor movement test enabled at %.1f Hz.", (double)test_cmd.left_step_hz);
 
     int64_t last_tmc_log_us = 0;
+    int64_t last_dir_toggle_us = 0;
+    int64_t motion_start_us = esp_timer_get_time();
+    bool motion_stopped = false;
     
     while (1) {
         imu_module_poll_and_log(&imu);
         int64_t now_us = esp_timer_get_time();
+
+        if (!motion_stopped && (now_us - motion_start_us) >= 10000000) {
+            test_cmd.left_step_hz = 0.0f;
+            test_cmd.right_step_hz = 0.0f;
+            motor_module_apply_command(&motor_hal, &test_cmd);
+            motor_module_set_enabled(&motor_hal, false);
+            motion_stopped = true;
+            ESP_LOGI(TAG, "Motor movement test complete (10s). Outputs disabled.");
+        }
+
+        // Toggle direction every 3 seconds to validate both directions.
+        if (!motion_stopped && (now_us - last_dir_toggle_us) >= 3000000) {
+            test_cmd.left_step_hz = -test_cmd.left_step_hz;
+            test_cmd.right_step_hz = -test_cmd.right_step_hz;
+            motor_module_apply_command(&motor_hal, &test_cmd);
+            ESP_LOGI(TAG, "Motor direction toggled. left=%.1f right=%.1f",
+                     (double)test_cmd.left_step_hz,
+                     (double)test_cmd.right_step_hz);
+            last_dir_toggle_us = now_us;
+        }
 
         // Log TMC temperature every 1 second
         if ((now_us - last_tmc_log_us) >= 1000000) {
