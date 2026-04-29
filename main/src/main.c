@@ -13,21 +13,24 @@ static const char *TAG = "motor_test";
 static TaskHandle_t s_main_task_handle = NULL;
 
 // TMC2240 SPI test wiring (adjust to your board).
-#define TMC_SPI_HOST SPI2_HOST
-#define TMC_SPI_SCLK GPIO_NUM_16
-#define TMC_SPI_MOSI GPIO_NUM_15
-#define TMC_SPI_MISO GPIO_NUM_10
-#define TMC_LEFT_SPI_CS   GPIO_NUM_12
-#define TMC_DIAG0    GPIO_NUM_6
-#define TMC_EN       GPIO_NUM_18
-#define TMC_LEFT_STEP     GPIO_NUM_8
-#define TMC_LEFT_DIR      GPIO_NUM_13
+#define TMC_SPI_HOST        SPI2_HOST
+#define TMC_SPI_SCLK        GPIO_NUM_16
+#define TMC_SPI_MOSI        GPIO_NUM_15
+#define TMC_SPI_MISO        GPIO_NUM_10
+#define TMC_EN              GPIO_NUM_18
+
+// ============== LEFT MOTOR PINS ==============
+
+#define TMC_LEFT_STEP       GPIO_NUM_8
+#define TMC_LEFT_DIR        GPIO_NUM_13
+#define TMC_LEFT_SPI_CS     GPIO_NUM_12
+#define TMC_LEFT_DIAG0      GPIO_NUM_6
 
 // ============== RIGHT MOTOR PINS ==============
-#define TMC_RIGHT_STEP     GPIO_NUM_2
-#define TMC_RIGHT_DIR      GPIO_NUM_1
-#define TMC_RIGHT_SPI_CS   GPIO_NUM_39
-#define TMC_RIGHT_DIAG0    GPIO_NUM_41
+#define TMC_RIGHT_STEP      GPIO_NUM_2
+#define TMC_RIGHT_DIR       GPIO_NUM_1
+#define TMC_RIGHT_SPI_CS    GPIO_NUM_39
+#define TMC_RIGHT_DIAG0     GPIO_NUM_41
 
 void app_main(void)
 {

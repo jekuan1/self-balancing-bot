@@ -60,23 +60,39 @@ static esp_err_t tmc2240_transfer_40b_ctx(tmc2240_spi_ctx_t *ctx, uint8_t tx[5],
     return spi_device_transmit(ctx->spi_dev, &t);
 }
 
-static esp_err_t tmc2240_read_reg_quiet_ctx(tmc2240_spi_ctx_t *ctx, uint8_t reg_addr, uint32_t *value_out)
+// Forward declarations for functions defined later but used earlier.
+static esp_err_t tmc2240_read_reg_raw_ctx(tmc2240_spi_ctx_t *ctx,
+                                          uint8_t reg_addr,
+                                          uint8_t tx_cmd[5],
+                                          uint8_t rx_cmd[5],
+                                          uint8_t rx_data[5]);
+static void tmc2240_miso_sanity_check_once(tmc2240_spi_ctx_t *ctx);
+
+
+// Convenience: write a 32-bit register to a specific TMC2240 context.
+static esp_err_t tmc2240_write_reg_ctx(tmc2240_spi_ctx_t *ctx, uint8_t reg_addr, uint32_t value)
 {
-    if (ctx == NULL || value_out == NULL) {
-        return ESP_ERR_INVALID_ARG;
-    }
-    uint8_t tx_cmd[5] = {(uint8_t)(reg_addr & 0x7FU), 0, 0, 0, 0};
+    if (ctx == NULL) return ESP_ERR_INVALID_ARG;
+    uint8_t tx[5] = {
+        (uint8_t)(reg_addr | 0x80U),
+        (uint8_t)(value >> 24),
+        (uint8_t)(value >> 16),
+        (uint8_t)(value >> 8),
+        (uint8_t)(value),
+    };
+    uint8_t rx[5] = {0};
+    return tmc2240_transfer_40b_ctx(ctx, tx, rx);
+}
+
+// Convenience: read a 32-bit register from a specific TMC2240 context.
+static esp_err_t tmc2240_read_reg_u32_ctx(tmc2240_spi_ctx_t *ctx, uint8_t reg_addr, uint32_t *value_out)
+{
+    if (ctx == NULL || value_out == NULL) return ESP_ERR_INVALID_ARG;
+    uint8_t tx_cmd[5] = {0};
     uint8_t rx_cmd[5] = {0};
     uint8_t rx_data[5] = {0};
-    esp_err_t err = tmc2240_transfer_40b_ctx(ctx, tx_cmd, rx_cmd);
-    if (err != ESP_OK) {
-        return err;
-    }
-    uint8_t tx_nop[5] = {0, 0, 0, 0, 0};
-    err = tmc2240_transfer_40b_ctx(ctx, tx_nop, rx_data);
-    if (err != ESP_OK) {
-        return err;
-    }
+    esp_err_t err = tmc2240_read_reg_raw_ctx(ctx, reg_addr, tx_cmd, rx_cmd, rx_data);
+    if (err != ESP_OK) return err;
     *value_out = tmc2240_u32_from_frame_data(rx_data);
     return ESP_OK;
 }
@@ -179,7 +195,11 @@ static esp_err_t tmc2240_spi_init_ctx(tmc2240_spi_ctx_t *ctx,
     uint32_t best_ioin = 0;
     int best_mode = -1;
 
-    for (int mode = 0; mode <= 3; mode++) {
+    // Prefer mode 3 (CPOL=1, CPHA=1) which is commonly used by Trinamic
+    // SPI devices; try it first, then try the other modes.
+    int probe_modes[] = {3, 0, 1, 2};
+    for (size_t mi = 0; mi < sizeof(probe_modes)/sizeof(probe_modes[0]); ++mi) {
+        int mode = probe_modes[mi];
         spi_device_interface_config_t dev_cfg = {
             .clock_speed_hz = spi_clock_hz,
             .mode = mode,
@@ -204,8 +224,8 @@ static esp_err_t tmc2240_spi_init_ctx(tmc2240_spi_ctx_t *ctx,
 
         // Read IOIN a couple times; choose a mode that doesn't look like a stuck constant.
         uint32_t ioin1 = 0, ioin2 = 0;
-        esp_err_t r1 = tmc2240_read_reg_quiet_ctx(ctx, 0x04, &ioin1);
-        esp_err_t r2 = tmc2240_read_reg_quiet_ctx(ctx, 0x04, &ioin2);
+        esp_err_t r1 = tmc2240_read_reg_u32_ctx(ctx, 0x04, &ioin1);
+        esp_err_t r2 = tmc2240_read_reg_u32_ctx(ctx, 0x04, &ioin2);
         if (r1 == ESP_OK && r2 == ESP_OK && tmc2240_ioin_looks_plausible(ioin2)) {
             best_mode = mode;
             best_ioin = ioin2;
@@ -241,6 +261,9 @@ static esp_err_t tmc2240_spi_init_ctx(tmc2240_spi_ctx_t *ctx,
                  ctx->label, best_mode, (unsigned long)best_ioin);
     }
 
+    // Perform one-time MISO floatiness check (useful for debugging wiring/CS issues)
+    tmc2240_miso_sanity_check_once(ctx);
+
     ESP_LOGI(TAG, "TMC2240 %s SPI initialized (host=%d, cs=%d, sclk=%d, mosi=%d, miso=%d)",
              ctx->label, spi_host, cs_pin, sclk_pin, mosi_pin, miso_pin);
     return ESP_OK;
@@ -270,16 +293,31 @@ static void tmc2240_miso_sanity_check_once(tmc2240_spi_ctx_t *ctx)
 
     gpio_set_pull_mode(ctx->miso_pin, GPIO_PULLDOWN_ONLY);
 
-    ESP_LOGW(TAG,
-             "%s MISO sanity: gpio_level PD=%d PU=%d | PD=%02X %02X %02X %02X %02X | PU=%02X %02X %02X %02X %02X",
-             ctx->label,
-             miso_level_pd,
-             miso_level_pu,
-             rx_pd[0], rx_pd[1], rx_pd[2], rx_pd[3], rx_pd[4],
-             rx_pu[0], rx_pu[1], rx_pu[2], rx_pu[3], rx_pu[4]);
-    ESP_LOGW(TAG,
-             "%s If PD and PU differ a lot, MISO is likely floating (wrong CS/wiring).",
-             ctx->label);
+    // Count byte differences between PD and PU reads.
+    int diff_count = 0;
+    for (int i = 0; i < 5; ++i) {
+        if (rx_pd[i] != rx_pu[i]) ++diff_count;
+    }
+
+    // Only warn if the received frames actually differ; a sole GPIO-level
+    // change is noisy on some platforms and doesn't indicate bus corruption
+    // if the frame bytes are identical.
+    if (diff_count > 0) {
+        ESP_LOGW(TAG,
+                 "%s MISO sanity: gpio_level PD=%d PU=%d | PD=%02X %02X %02X %02X %02X | PU=%02X %02X %02X %02X %02X",
+                 ctx->label,
+                 miso_level_pd,
+                 miso_level_pu,
+                 rx_pd[0], rx_pd[1], rx_pd[2], rx_pd[3], rx_pd[4],
+                 rx_pu[0], rx_pu[1], rx_pu[2], rx_pu[3], rx_pu[4]);
+        ESP_LOGW(TAG,
+                 "%s If PD and PU differ a lot, MISO is likely floating (wrong CS/wiring).",
+                 ctx->label);
+    } else {
+        ESP_LOGD(TAG,
+                 "%s MISO sanity: gpio levels PD=%d PU=%d but frames identical; suppressing warning.",
+                 ctx->label, miso_level_pd, miso_level_pu);
+    }
 }
 
 static void stepper_channel_init(stepper_channel_t *ch)
@@ -329,18 +367,9 @@ static esp_err_t tmc2240_read_temp_c_ctx(tmc2240_spi_ctx_t *ctx, float *out_temp
 {
     if (ctx == NULL || out_temp_c == NULL) return ESP_ERR_INVALID_ARG;
     if (!ctx->initialized) return ESP_ERR_INVALID_STATE;
-
-    uint8_t tx[5] = {0};
-    uint8_t rx_cmd[5] = {0};
-    uint8_t rx_data[5] = {0};
-
-    esp_err_t err = tmc2240_read_reg_raw_ctx(ctx, 0x51, tx, rx_cmd, rx_data);
+    uint32_t temp_raw = 0;
+    esp_err_t err = tmc2240_read_reg_u32_ctx(ctx, 0x51, &temp_raw);
     if (err != ESP_OK) return err;
-
-    uint32_t temp_raw = ((uint32_t)rx_data[1] << 24) |
-                        ((uint32_t)rx_data[2] << 16) |
-                        ((uint32_t)rx_data[3] << 8) |
-                        ((uint32_t)rx_data[4]);
     *out_temp_c = ((float)((uint16_t)(temp_raw & 0x00001FFF)) - 2038.0f) / 7.7f;
     return ESP_OK;
 }
@@ -434,16 +463,7 @@ esp_err_t motor_module_tmc2240_right_spi_init(int spi_host,
 
 esp_err_t motor_module_tmc2240_write_reg(uint8_t reg_addr, uint32_t value)
 {
-    uint8_t tx[5] = {
-        (uint8_t)(reg_addr | 0x80U),
-        (uint8_t)(value >> 24),
-        (uint8_t)(value >> 16),
-        (uint8_t)(value >> 8),
-        (uint8_t)(value),
-    };
-    uint8_t rx[5] = {0};
-
-    return tmc2240_transfer_40b_ctx(&s_tmc2240_left_ctx, tx, rx);
+    return tmc2240_write_reg_ctx(&s_tmc2240_left_ctx, reg_addr, value);
 }
 
 esp_err_t motor_module_tmc2240_read_reg(uint8_t reg_addr, uint32_t *value_out)
@@ -451,20 +471,7 @@ esp_err_t motor_module_tmc2240_read_reg(uint8_t reg_addr, uint32_t *value_out)
     if (value_out == NULL) {
         return ESP_ERR_INVALID_ARG;
     }
-
-    uint8_t tx_cmd[5] = {0};
-    uint8_t rx_cmd[5] = {0};
-    uint8_t rx_data[5] = {0};
-    esp_err_t err = tmc2240_read_reg_raw_ctx(&s_tmc2240_left_ctx, reg_addr, tx_cmd, rx_cmd, rx_data);
-    if (err != ESP_OK) {
-        return err;
-    }
-
-    *value_out = ((uint32_t)rx_data[1] << 24) |
-                 ((uint32_t)rx_data[2] << 16) |
-                 ((uint32_t)rx_data[3] << 8) |
-                 ((uint32_t)rx_data[4]);
-    return ESP_OK;
+    return tmc2240_read_reg_u32_ctx(&s_tmc2240_left_ctx, reg_addr, value_out);
 }
 
 void motor_module_tmc2240_test_log(void)
@@ -485,10 +492,6 @@ void motor_module_tmc2240_test_log(void)
     }
 }
 
-void motor_module_tmc2240_right_test_log(void)
-{
-    // No-op: combined temperature log is produced by motor_module_tmc2240_test_log().
-}
 void motor_module_tmc2240_configure_robot_mode(void)
 {
     tmc2240_spi_ctx_t *ctxs[2] = {&s_tmc2240_left_ctx, &s_tmc2240_right_ctx};
