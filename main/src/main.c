@@ -103,10 +103,11 @@ static void supervisor_task_fn(void *arg)
         if (imu_module_read_sample(&runtime->imu, &sample) == ESP_OK) {
             int64_t now_us = esp_timer_get_time();
             if (now_us - last_print_us >= 10000) {
-                ESP_LOGI(TAG, "Yaw: %8.3f | Pitch: %8.3f | Roll: %8.3f",
-                         (double)sample.yaw_deg,
-                         (double)sample.pitch_deg,
-                         (double)sample.roll_deg);
+                // ESP_LOGI(TAG, "Yaw: %8.3f | Pitch: %8.3f | Roll: %8.3f",
+                //          (double)sample.yaw_deg,
+                //          (double)sample.pitch_deg,
+                //          (double)sample.roll_deg);
+                motor_module_tmc2240_test_log();
                 last_print_us = now_us;
             }
         } else {

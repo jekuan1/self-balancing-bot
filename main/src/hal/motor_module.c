@@ -70,7 +70,8 @@ static uint8_t tmc2240_extract_spi_status(const uint8_t rx[5])
     return rx[0];
 }
 
-// Check SPI_STATUS for critical bits and log if any are set.
+// Check SPI_STATUS for notable bits. Some bits are noisy on this device and
+// should not be treated as hard faults unless corroborated elsewhere.
 static void tmc2240_check_spi_status(tmc2240_spi_ctx_t *ctx, uint8_t status_byte)
 {
     if (ctx == NULL) return;
@@ -81,7 +82,7 @@ static void tmc2240_check_spi_status(tmc2240_spi_ctx_t *ctx, uint8_t status_byte
     const bool standstill = (status_byte & (1U << 2)) != 0;
 
     if (driver_error) {
-        ESP_LOGW(TAG, "%s SPI_STATUS: driver_error detected", ctx->label);
+        ESP_LOGD(TAG, "%s SPI_STATUS: driver_error bit set (ignored unless GSTAT/DRV_STATUS also fault)", ctx->label);
     }
     if (reset_flag) {
         ESP_LOGD(TAG, "%s SPI_STATUS: reset_flag detected (chip ready)", ctx->label);
@@ -417,19 +418,19 @@ static void tmc2240_miso_sanity_check_once(tmc2240_spi_ctx_t *ctx)
         if (rx_pd[i] != rx_pu[i]) ++payload_diff_count;
     }
 
-    // Only warn if the received frames actually differ; a sole GPIO-level
-    // change is noisy on some platforms and doesn't indicate bus corruption
-    // if the frame bytes are identical.
+    // This check is only a heuristic. The payload can legitimately differ
+    // between back-to-back frames because the TMC2240 uses delayed reads.
+    // Keep it as debug-only telemetry so it does not spam normal startup logs.
     if (payload_diff_count > 0) {
-        ESP_LOGW(TAG,
+        ESP_LOGD(TAG,
                  "%s MISO sanity: gpio_level PD=%d PU=%d | PD=%02X %02X %02X %02X %02X | PU=%02X %02X %02X %02X %02X",
                  ctx->label,
                  miso_level_pd,
                  miso_level_pu,
                  rx_pd[0], rx_pd[1], rx_pd[2], rx_pd[3], rx_pd[4],
                  rx_pu[0], rx_pu[1], rx_pu[2], rx_pu[3], rx_pu[4]);
-        ESP_LOGW(TAG,
-                 "%s If PD and PU differ a lot, MISO is likely floating (wrong CS/wiring).",
+        ESP_LOGD(TAG,
+                 "%s MISO sanity: payload differs across pulls; this can be normal for delayed-read SPI.",
                  ctx->label);
     } else {
         ESP_LOGD(TAG,
