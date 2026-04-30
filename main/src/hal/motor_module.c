@@ -154,6 +154,17 @@ static uint8_t tmc2240_current_ma_to_cs(uint16_t current_ma)
     return (uint8_t)(cs_f + 0.5f);
 }
 
+static uint8_t tmc2240_select_current_range(uint16_t run_current_ma)
+{
+    if (run_current_ma < 1100U) {
+        return 0x0;
+    }
+    if (run_current_ma < 2300U) {
+        return 0x1;
+    }
+    return 0x2;
+}
+
 // Convenience: write a 32-bit register to a specific TMC2240 context.
 static esp_err_t tmc2240_write_reg_ctx(tmc2240_spi_ctx_t *ctx, uint8_t reg_addr, uint32_t value)
 {
@@ -606,10 +617,49 @@ static esp_err_t tmc2240_read_temp_c_ctx(tmc2240_spi_ctx_t *ctx, float *out_temp
     return ESP_OK;
 }
 
+static esp_err_t tmc2240_read_current_est_ma_ctx(tmc2240_spi_ctx_t *ctx, float *out_current_ma)
+{
+    if (ctx == NULL || out_current_ma == NULL) return ESP_ERR_INVALID_ARG;
+    if (!ctx->initialized) return ESP_ERR_INVALID_STATE;
+
+    uint32_t drv_status = 0;
+    esp_err_t err = tmc2240_read_reg_u32_ctx(ctx, 0x6F, &drv_status);
+    if (err != ESP_OK) return err;
+
+    // CS_ACTUAL is a current scale, not direct amperes. Estimate RMS current
+    // using the same 2.3A full-scale assumption used elsewhere in this file.
+    const float max_rms_ma = 2300.0f;
+    const float cs_actual = (float)((drv_status >> 16) & 0x1FU);
+    *out_current_ma = ((cs_actual + 1.0f) / 32.0f) * max_rms_ma;
+    return ESP_OK;
+}
+
+static esp_err_t tmc2240_read_pwm_diag_ctx(tmc2240_spi_ctx_t *ctx, uint32_t *pwm_status_out, uint32_t *pwm_auto_out)
+{
+    if (ctx == NULL || pwm_status_out == NULL) return ESP_ERR_INVALID_ARG;
+    if (!ctx->initialized) return ESP_ERR_INVALID_STATE;
+
+    esp_err_t err = tmc2240_read_reg_u32_ctx(ctx, 0x71, pwm_status_out);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    if (pwm_auto_out != NULL) {
+        err = tmc2240_read_reg_u32_ctx(ctx, 0x72, pwm_auto_out);
+        if (err != ESP_OK) {
+            return err;
+        }
+    }
+
+    return ESP_OK;
+}
+
 void motor_module_init(motor_module_t *motor)
 {
     stepper_channel_init(&motor->left);
     stepper_channel_init(&motor->right);
+    set_enable_pin(&motor->left, true);
+    set_enable_pin(&motor->right, true);
     motor_module_set_enabled(motor, false);
 
     s_active_motor = motor;
@@ -645,8 +695,18 @@ void motor_module_set_enabled(motor_module_t *motor, bool enable)
 {
     motor->left.enabled = enable;
     motor->right.enabled = enable;
-    set_enable_pin(&motor->left, enable);
-    set_enable_pin(&motor->right, enable);
+
+    if (enable) {
+        set_enable_pin(&motor->left, true);
+        set_enable_pin(&motor->right, true);
+    } else {
+        motor->left.target_hz = 0.0f;
+        motor->right.target_hz = 0.0f;
+        motor->left.step_level = false;
+        motor->right.step_level = false;
+        if (motor->left.step_pin >= 0) gpio_set_level(motor->left.step_pin, 0);
+        if (motor->right.step_pin >= 0) gpio_set_level(motor->right.step_pin, 0);
+    }
 }
 
 void motor_module_apply_command(motor_module_t *motor, const motor_command_t *command)
@@ -742,26 +802,67 @@ void motor_module_tmc2240_test_log(void)
 {
     float left_temp = NAN;
     float right_temp = NAN;
+    float left_current_ma = NAN;
+    float right_current_ma = NAN;
+    uint32_t left_pwm_status = 0;
+    uint32_t right_pwm_status = 0;
+    uint32_t left_pwm_auto = 0;
+    uint32_t right_pwm_auto = 0;
     esp_err_t lerr = tmc2240_read_temp_c_ctx(&s_tmc2240_left_ctx, &left_temp);
     esp_err_t rerr = tmc2240_read_temp_c_ctx(&s_tmc2240_right_ctx, &right_temp);
+    esp_err_t lcurr_err = tmc2240_read_current_est_ma_ctx(&s_tmc2240_left_ctx, &left_current_ma);
+    esp_err_t rcurr_err = tmc2240_read_current_est_ma_ctx(&s_tmc2240_right_ctx, &right_current_ma);
+    esp_err_t lpwm_err = tmc2240_read_pwm_diag_ctx(&s_tmc2240_left_ctx, &left_pwm_status, &left_pwm_auto);
+    esp_err_t rpwm_err = tmc2240_read_pwm_diag_ctx(&s_tmc2240_right_ctx, &right_pwm_status, &right_pwm_auto);
 
-    if (lerr == ESP_OK && rerr == ESP_OK) {
-        ESP_LOGI(TAG, "TMC TEMP — LEFT: %.2f C | RIGHT: %.2f C", (double)left_temp, (double)right_temp);
-    } else if (lerr == ESP_OK) {
-        ESP_LOGI(TAG, "TMC TEMP — LEFT: %.2f C | RIGHT: ERR", (double)left_temp);
-    } else if (rerr == ESP_OK) {
-        ESP_LOGI(TAG, "TMC TEMP — LEFT: ERR | RIGHT: %.2f C", (double)right_temp);
+    const bool left_ok = (lerr == ESP_OK && lcurr_err == ESP_OK && lpwm_err == ESP_OK);
+    const bool right_ok = (rerr == ESP_OK && rcurr_err == ESP_OK && rpwm_err == ESP_OK);
+    const uint16_t left_pwm_scale_sum = (uint16_t)(left_pwm_status & 0x03FFU);
+    const uint16_t right_pwm_scale_sum = (uint16_t)(right_pwm_status & 0x03FFU);
+
+    if (left_ok && right_ok) {
+        ESP_LOGI(TAG,
+                 "TMC — LEFT: %.2f C, %.0f mA, PWM_SUM=%u, AUTO=%u | RIGHT: %.2f C, %.0f mA, PWM_SUM=%u, AUTO=%u",
+                 (double)left_temp,
+                 (double)left_current_ma,
+                 (unsigned)left_pwm_scale_sum,
+                 (unsigned)left_pwm_auto,
+                 (double)right_temp,
+                 (double)right_current_ma,
+                 (unsigned)right_pwm_scale_sum,
+                 (unsigned)right_pwm_auto);
+    } else if (left_ok) {
+        ESP_LOGI(TAG,
+                 "TMC — LEFT: %.2f C, %.0f mA, PWM_SUM=%u, AUTO=%u | RIGHT: ERR",
+                 (double)left_temp,
+                 (double)left_current_ma,
+                 (unsigned)left_pwm_scale_sum,
+                 (unsigned)left_pwm_auto);
+    } else if (right_ok) {
+        ESP_LOGI(TAG,
+                 "TMC — LEFT: ERR | RIGHT: %.2f C, %.0f mA, PWM_SUM=%u, AUTO=%u",
+                 (double)right_temp,
+                 (double)right_current_ma,
+                 (unsigned)right_pwm_scale_sum,
+                 (unsigned)right_pwm_auto);
     } else {
-        ESP_LOGW(TAG, "TMC TEMP — LEFT: ERR(%s) | RIGHT: ERR(%s)", esp_err_to_name(lerr), esp_err_to_name(rerr));
+        ESP_LOGW(TAG,
+                 "TMC — LEFT: ERR(%s/%s/%s) | RIGHT: ERR(%s/%s/%s)",
+                 esp_err_to_name(lerr),
+                 esp_err_to_name(lcurr_err),
+                 esp_err_to_name(lpwm_err),
+                 esp_err_to_name(rerr),
+                 esp_err_to_name(rcurr_err),
+                 esp_err_to_name(rpwm_err));
     }
 }
 
 void motor_module_tmc2240_configure_robot_mode(const TMC2240_RobotConfig_t *config)
 {
     TMC2240_RobotConfig_t cfg = {
-        .run_current_ma = 500,        // Your 0.5A soft limit for driving
-        .hold_current_ma = 150,       // Dropped to 150mA to stay cool at standstill
-        .microsteps = 16,             // Increased to 16 for better precision
+        .run_current_ma = 500,        // Quiet driving current for the low-range setting
+        .hold_current_ma = 100,       // Drop hold current to reduce standstill hiss
+        .microsteps = 16,             // 16 microsteps with interpolation to 256 internally
         .interpolate = true,          // MUST BE TRUE for that "silky smooth" TMC motion
         .stealth_threshold = 500,     // Enable StealthChop for silent operation
         .stall_sensitivity = 0,       // Keep at 0 until you are ready for StallGuard
@@ -774,6 +875,7 @@ void motor_module_tmc2240_configure_robot_mode(const TMC2240_RobotConfig_t *conf
     const uint8_t mres = tmc2240_microsteps_to_mres(cfg.microsteps);
     const uint8_t irun_cs = tmc2240_current_ma_to_cs(cfg.run_current_ma);
     const uint8_t ihold_cs = tmc2240_current_ma_to_cs(cfg.hold_current_ma);
+    const uint8_t current_range = tmc2240_select_current_range(cfg.run_current_ma);
 
     // Keep these fields in API for future tuning; not yet wired to board logic.
     (void)cfg.stall_sensitivity;
@@ -839,18 +941,39 @@ void motor_module_tmc2240_configure_robot_mode(const TMC2240_RobotConfig_t *conf
             (void)tmc2240_write_reg_ctx(ctx, 0x00, 0x00000004);
         }
 
-        // Configure DRV_CONF for Lossless Sensing: set CURRENT_RANGE=1 (2.3A RMS)
-        // and slope control bits for smooth current transitions.
-        uint32_t drv_conf = (2UL << 16) | (1UL << 0);
+        // Configure DRV_CONF for integrated current sensing.
+        // Use the lowest range that still covers the requested run current so
+        // the internal ADC has the best resolution.
+        uint32_t drv_conf = ((uint32_t)current_range << 16) | (1UL << 0);
         (void)tmc2240_write_reg_ctx(ctx, 0x0A, drv_conf);
+
+        // Configure Standstill Power Down timing: TPOWERDOWN (0x11)
+        // This keeps the bridge powered while stepping stops, letting the
+        // driver decay current gracefully instead of dropping the EN pin.
+        (void)tmc2240_write_reg_ctx(ctx, 0x11, 10);
+
+        // Set the velocity threshold for StealthChop2 -> SpreadCycle switchover.
+        // This is a starting point; tune it for your target RPM and supply.
+        if (cfg.stealth_threshold > 0) {
+            (void)tmc2240_write_reg_ctx(ctx, 0x13, cfg.stealth_threshold);
+        }
+
+        // Enable StealthChop2 auto-tuning and keep freewheel disabled so the
+        // driver maintains holding torque using IHOLD at standstill.
+        uint32_t pwmconf = (1UL << 18) | (1UL << 19);
+        (void)tmc2240_write_reg_ctx(ctx, 0x70, pwmconf);
+
+        // Give the driver time to perform standstill tuning (AT#1) before motion.
+        esp_rom_delay_us(130000);
+
+        // Optional transition helper: align the phase between chopper modes.
+        // This is a conservative default offset that can be tuned later.
+        if (cfg.stealth_threshold > 0) {
+            (void)tmc2240_write_reg_ctx(ctx, 0x74, 0x00000001);
+        }
 
         // Set GLOBALSCALER to 0 (full scale / 256) for standard scaling.
         (void)tmc2240_write_reg_ctx(ctx, 0x0B, 0);
-
-        // Configure Standstill Power Down timing: TPOWERDOWN (0x11)
-        // Sets the delay (in motor clock cycles) for current ramp-down after
-        // the last STEP pulse. Default is often insufficient; set to ~20.
-        (void)tmc2240_write_reg_ctx(ctx, 0x11, 20);
 
         // Configure operational parameters from the requested config.
         uint32_t chopconf = 0x10410150;
@@ -881,11 +1004,12 @@ void motor_module_tmc2240_configure_robot_mode(const TMC2240_RobotConfig_t *conf
         }
 
         ESP_LOGI(TAG,
-                 "%s TMC2240 config: microsteps=%u IRUN_CS=%u IHOLD_CS=%u INTPOL=%d TPWMTHRS=%lu",
+                 "%s TMC2240 config: microsteps=%u IRUN_CS=%u IHOLD_CS=%u RANGE=%u INTPOL=%d TPWMTHRS=%lu PWM_AUTOSCALE=1 PWM_AUTOGRAD=1",
                  ctx->label,
                  (unsigned)cfg.microsteps,
                  (unsigned)irun_cs,
                  (unsigned)ihold_cs,
+                 (unsigned)current_range,
                  cfg.interpolate ? 1 : 0,
                  (unsigned long)cfg.stealth_threshold);
     }

@@ -58,7 +58,13 @@ static void control_task_fn(void *arg)
     runtime->motion_stopped = false;
 
     motor_module_set_enabled(&runtime->motor_hal, true);
+    ESP_LOGI(TAG, "AT#1: holding standstill for StealthChop2 tuning before first move...");
+    vTaskDelay(pdMS_TO_TICKS(150));
+
+    runtime->motion_start_us = esp_timer_get_time();
+    runtime->last_dir_toggle_us = runtime->motion_start_us;
     motor_module_apply_command(&runtime->motor_hal, &runtime->test_cmd);
+    ESP_LOGI(TAG, "AT#2: starting first move after tuning delay");
 
     TickType_t last_wake = xTaskGetTickCount();
     while (1) {
@@ -68,9 +74,8 @@ static void control_task_fn(void *arg)
             runtime->test_cmd.left_step_hz = 0.0f;
             runtime->test_cmd.right_step_hz = 0.0f;
             motor_module_apply_command(&runtime->motor_hal, &runtime->test_cmd);
-            motor_module_set_enabled(&runtime->motor_hal, false);
             runtime->motion_stopped = true;
-            ESP_LOGI(TAG, "Test Complete: 10 seconds elapsed.");
+            ESP_LOGI(TAG, "Test Complete: 10 seconds elapsed; motor driver remains enabled for standstill current control.");
         }
 
         if (!runtime->motion_stopped && (now_us - runtime->last_dir_toggle_us) >= 3000000) {
@@ -97,12 +102,14 @@ static void supervisor_task_fn(void *arg)
     int64_t last_wait_us = 0;
 
     while (1) {
-        imu_module_poll_and_log(&runtime->imu);
+        if (runtime->imu.i2c_dev != NULL) {
+            imu_module_poll_and_log(&runtime->imu);
+        }
 
         imu_sample_t sample;
         if (imu_module_read_sample(&runtime->imu, &sample) == ESP_OK) {
             int64_t now_us = esp_timer_get_time();
-            if (now_us - last_print_us >= 10000) {
+            if (now_us - last_print_us >= 1000000) {
                 // ESP_LOGI(TAG, "Yaw: %8.3f | Pitch: %8.3f | Roll: %8.3f",
                 //          (double)sample.yaw_deg,
                 //          (double)sample.pitch_deg,
@@ -162,11 +169,11 @@ void app_main(void)
     }
 
     TMC2240_RobotConfig_t silent_config = {
-        .run_current_ma = 800,
-        .hold_current_ma = 200,
+        .run_current_ma = 500,
+        .hold_current_ma = 100,
         .microsteps = 16,
         .interpolate = true,
-        .stealth_threshold = 0,
+        .stealth_threshold = 500,
         .stall_sensitivity = 0,
         .cool_step_enabled = false,
     };

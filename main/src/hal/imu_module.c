@@ -478,6 +478,10 @@ void imu_module_enable_default_reports(imu_module_t *imu)
 
 void imu_module_poll_and_log(imu_module_t *imu)
 {
+    if (imu == NULL || imu->i2c_dev == NULL) {
+        return;
+    }
+
     sh2_service();
 
     if (imu->reset_seen) {
