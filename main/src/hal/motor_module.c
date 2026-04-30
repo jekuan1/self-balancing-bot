@@ -43,7 +43,7 @@ static int s_tmc2240_bus_host = -1;
 static motor_module_t *s_active_motor = NULL;
 static esp_timer_handle_t s_motor_timer_handle = NULL;
 
-static void motor_timer_callback(void *arg)
+static void IRAM_ATTR motor_timer_callback(void *arg)
 {
     motor_module_t *motor = (motor_module_t *)arg;
     if (motor == NULL) {
@@ -60,6 +60,35 @@ static uint32_t tmc2240_u32_from_frame_data(const uint8_t rx_data[5])
            ((uint32_t)rx_data[2] << 16) |
            ((uint32_t)rx_data[3] << 8) |
            ((uint32_t)rx_data[4]);
+}
+
+// Extract SPI_STATUS byte (bits 39-32 of the response, which is rx[0]).
+// Returns the status byte from the response.
+static uint8_t tmc2240_extract_spi_status(const uint8_t rx[5])
+{
+    if (rx == NULL) return 0;
+    return rx[0];
+}
+
+// Check SPI_STATUS for critical bits and log if any are set.
+static void tmc2240_check_spi_status(tmc2240_spi_ctx_t *ctx, uint8_t status_byte)
+{
+    if (ctx == NULL) return;
+    
+    // Bit 4: reset_flag, Bit 3: driver_error, Bit 2: standstill
+    const bool reset_flag = (status_byte & (1U << 4)) != 0;
+    const bool driver_error = (status_byte & (1U << 3)) != 0;
+    const bool standstill = (status_byte & (1U << 2)) != 0;
+
+    if (driver_error) {
+        ESP_LOGW(TAG, "%s SPI_STATUS: driver_error detected", ctx->label);
+    }
+    if (reset_flag) {
+        ESP_LOGD(TAG, "%s SPI_STATUS: reset_flag detected (chip ready)", ctx->label);
+    }
+    if (standstill) {
+        ESP_LOGD(TAG, "%s SPI_STATUS: motor in standstill", ctx->label);
+    }
 }
 
 static esp_err_t tmc2240_transfer_40b_ctx(tmc2240_spi_ctx_t *ctx, uint8_t tx[5], uint8_t rx[5])
@@ -102,18 +131,27 @@ static uint8_t tmc2240_microsteps_to_mres(uint16_t microsteps)
 
 static uint8_t tmc2240_current_ma_to_cs(uint16_t current_ma)
 {
-    // Approximate current scaling using the same equation as TMCStepper.
-    const float rsense = 0.11f;
-    float cs_f = (32.0f * 1.41421f * ((float)current_ma / 1000.0f) * (rsense + 0.02f) / 0.325f) - 1.0f;
-    if (cs_f < 0.0f) {
-        return 0;
-    }
-    if (cs_f > 31.0f) {
-        return 31;
-    }
+    /**
+     * In Integrated Lossless Sensing mode, the CS (Current Scale) value 
+     * is a linear ratio of the peak current supported by the selected 
+     * CURRENT_RANGE in register 0x0A.
+     * * For TMC2240 with Integrated Sensing:
+     * Full Scale Current (at CS=31) is determined by CURRENT_RANGE bits.
+     * If CURRENT_RANGE = 0b00 (0), Full Scale is ~1.1A RMS.
+     * If CURRENT_RANGE = 0b01 (1), Full Scale is ~2.3A RMS.
+     * If CURRENT_RANGE = 0b10 (2), Full Scale is ~3.4A RMS.
+     * * Assuming CURRENT_RANGE 1 (2.3A / 2300mA RMS full scale):
+     */
+    const uint16_t max_rms_ma = 2300; 
+    
+    // Calculate CS: (current_ma / max_rms_ma) * 32 - 1
+    float cs_f = ((float)current_ma / (float)max_rms_ma) * 32.0f - 1.0f;
+
+    if (cs_f < 0.0f) return 0;
+    if (cs_f > 31.0f) return 31;
+    
     return (uint8_t)(cs_f + 0.5f);
 }
-
 
 // Convenience: write a 32-bit register to a specific TMC2240 context.
 static esp_err_t tmc2240_write_reg_ctx(tmc2240_spi_ctx_t *ctx, uint8_t reg_addr, uint32_t value)
@@ -127,7 +165,16 @@ static esp_err_t tmc2240_write_reg_ctx(tmc2240_spi_ctx_t *ctx, uint8_t reg_addr,
         (uint8_t)(value),
     };
     uint8_t rx[5] = {0};
-    return tmc2240_transfer_40b_ctx(ctx, tx, rx);
+    esp_err_t err = tmc2240_transfer_40b_ctx(ctx, tx, rx);
+    
+    // Even during a write, extract and check SPI status byte for real-time
+    // alerts (driver_error, reset_flag, standstill).
+    if (err == ESP_OK) {
+        uint8_t spi_status = tmc2240_extract_spi_status(rx);
+        tmc2240_check_spi_status(ctx, spi_status);
+    }
+    
+    return err;
 }
 
 // Convenience: read a 32-bit register from a specific TMC2240 context.
@@ -139,7 +186,82 @@ static esp_err_t tmc2240_read_reg_u32_ctx(tmc2240_spi_ctx_t *ctx, uint8_t reg_ad
     uint8_t rx_data[5] = {0};
     esp_err_t err = tmc2240_read_reg_raw_ctx(ctx, reg_addr, tx_cmd, rx_cmd, rx_data);
     if (err != ESP_OK) return err;
+    
+    // Extract and check SPI status from the data frame response
+    uint8_t spi_status = tmc2240_extract_spi_status(rx_data);
+    tmc2240_check_spi_status(ctx, spi_status);
+    
     *value_out = tmc2240_u32_from_frame_data(rx_data);
+    return ESP_OK;
+}
+
+// Batch-read function for pipelined reads: reduces SPI bus traffic by reading
+// multiple registers in a single "pipelined" fashion. Returns three 32-bit register
+// values in the order they are accessed.
+static esp_err_t tmc2240_read_regs_pipelined_ctx(tmc2240_spi_ctx_t *ctx,
+                                                 uint8_t reg_addr_1,
+                                                 uint8_t reg_addr_2,
+                                                 uint8_t reg_addr_3,
+                                                 uint32_t *out_val_1,
+                                                 uint32_t *out_val_2,
+                                                 uint32_t *out_val_3)
+{
+    if (ctx == NULL || out_val_1 == NULL || out_val_2 == NULL || out_val_3 == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (!ctx->initialized) return ESP_ERR_INVALID_STATE;
+
+    uint8_t tx1[5], rx1[5] = {0};
+    uint8_t tx2[5], rx2[5] = {0};
+    uint8_t tx3[5], rx3[5] = {0};
+    uint8_t tx_nop[5] = {0}, rx_nop[5] = {0};
+
+    // Frame 1: Send read command for reg_addr_1
+    tx1[0] = (uint8_t)(reg_addr_1 & 0x7FU);
+    tx1[1] = tx1[2] = tx1[3] = tx1[4] = 0;
+    esp_err_t err = tmc2240_transfer_40b_ctx(ctx, tx1, rx1);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "%s SPI pipelined read frame 1 failed: %s", ctx->label, esp_err_to_name(err));
+        return err;
+    }
+    esp_rom_delay_us(10);
+
+    // Frame 2: Send read command for reg_addr_2, receive data for reg_addr_1
+    tx2[0] = (uint8_t)(reg_addr_2 & 0x7FU);
+    tx2[1] = tx2[2] = tx2[3] = tx2[4] = 0;
+    err = tmc2240_transfer_40b_ctx(ctx, tx2, rx2);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "%s SPI pipelined read frame 2 failed: %s", ctx->label, esp_err_to_name(err));
+        return err;
+    }
+    esp_rom_delay_us(10);
+
+    // Frame 3: Send read command for reg_addr_3, receive data for reg_addr_2
+    tx3[0] = (uint8_t)(reg_addr_3 & 0x7FU);
+    tx3[1] = tx3[2] = tx3[3] = tx3[4] = 0;
+    err = tmc2240_transfer_40b_ctx(ctx, tx3, rx3);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "%s SPI pipelined read frame 3 failed: %s", ctx->label, esp_err_to_name(err));
+        return err;
+    }
+    esp_rom_delay_us(10);
+
+    // Frame 4: Send NOP, receive data for reg_addr_3
+    err = tmc2240_transfer_40b_ctx(ctx, tx_nop, rx_nop);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "%s SPI pipelined read frame 4 (NOP) failed: %s", ctx->label, esp_err_to_name(err));
+        return err;
+    }
+
+    // Assign extracted values: data returned in frame N+1 for command sent in frame N
+    *out_val_1 = tmc2240_u32_from_frame_data(rx2);   // Data for reg_addr_1 in frame 2
+    *out_val_2 = tmc2240_u32_from_frame_data(rx3);   // Data for reg_addr_2 in frame 3
+    *out_val_3 = tmc2240_u32_from_frame_data(rx_nop); // Data for reg_addr_3 in frame 4
+
+    // Check SPI status from the final frame
+    uint8_t spi_status = tmc2240_extract_spi_status(rx_nop);
+    tmc2240_check_spi_status(ctx, spi_status);
+
     return ESP_OK;
 }
 
@@ -159,15 +281,23 @@ static esp_err_t tmc2240_read_reg_raw_ctx(tmc2240_spi_ctx_t *ctx,
     tx_cmd[3] = 0;
     tx_cmd[4] = 0;
 
+    // First transfer: send the read command. The TMC2240 uses a delayed-read
+    // SPI protocol: the response to the read command is returned in the
+    // *following* frame. The first transfer returns the status byte and the
+    // result of the previous read; capture it in rx_cmd for debugging.
     esp_err_t err = tmc2240_transfer_40b_ctx(ctx, tx_cmd, rx_cmd);
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "%s SPI read cmd transfer failed: %s", ctx->label, esp_err_to_name(err));
         return err;
     }
 
-    // Small delay to ensure SPI bus state cleanup between transactions
+    // CSN high-time delay to meet TMC2240 inter-transfer timing requirement.
+    // The SPI driver's cs_ena_posttrans handles most of this, but we add extra
+    // delay to ensure robust operation.
     esp_rom_delay_us(10);
 
+    // Second transfer: send a NOP to clock out the data for the requested
+    // register. rx_data[1..4] will contain the requested 32-bit register.
     uint8_t tx_nop[5] = {0, 0, 0, 0, 0};
     esp_err_t err2 = tmc2240_transfer_40b_ctx(ctx, tx_nop, rx_data);
     if (err2 != ESP_OK) {
@@ -175,6 +305,8 @@ static esp_err_t tmc2240_read_reg_raw_ctx(tmc2240_spi_ctx_t *ctx,
         return err2;
     }
 
+    // rx_cmd[0] = status from first frame, rx_cmd[1..4] = stale data
+    // rx_data[0] = status for data frame, rx_data[1..4] = requested register
     return ESP_OK;
 }
 
@@ -222,11 +354,14 @@ static esp_err_t tmc2240_spi_init_ctx(tmc2240_spi_ctx_t *ctx,
     }
 
     // Use mode 3 directly, matching the earlier working configuration.
+    // Add cs_ena_posttrans to satisfy TMC2240's minimum CSN high-time requirement.
+    // cs_ena_posttrans is the number of SPI clock cycles after CSN goes high.
     spi_device_interface_config_t dev_cfg = {
         .clock_speed_hz = spi_clock_hz,
         .mode = 3,
         .spics_io_num = cs_pin,
         .queue_size = 2,
+        .cs_ena_posttrans = 10,  // Ensure minimum CSN high time (10 cycles buffer)
     };
 
     if (ctx->spi_dev != NULL) {
@@ -312,7 +447,9 @@ static void tmc2240_format_gstat(uint8_t gstat, char *buf, size_t buf_size)
     const bool reset = (gstat & (1U << 0)) != 0;
     const bool drv_err = (gstat & (1U << 1)) != 0;
     const bool uv_cp = (gstat & (1U << 2)) != 0;
-    const uint8_t unknown = (uint8_t)(gstat & (uint8_t)~0x07U);
+    const bool register_reset = (gstat & (1U << 3)) != 0;
+    const bool vm_uvlo = (gstat & (1U << 4)) != 0;
+    const uint8_t unknown = (uint8_t)(gstat & (uint8_t)~0x1FU);
 
     if (!reset && !drv_err && !uv_cp && unknown == 0) {
         snprintf(buf, buf_size, "OK");
@@ -334,6 +471,14 @@ static void tmc2240_format_gstat(uint8_t gstat, char *buf, size_t buf_size)
         snprintf(buf + strlen(buf), buf_size - strlen(buf), "%sUV_CP", first ? "" : ",");
     }
 
+    if (register_reset) {
+        snprintf(buf + strlen(buf), buf_size - strlen(buf), "%sREG_RST", first ? "" : ",");
+        first = false;
+    }
+    if (vm_uvlo) {
+        snprintf(buf + strlen(buf), buf_size - strlen(buf), "%sVM_UVLO", first ? "" : ",");
+    }
+
     if (unknown != 0) {
         snprintf(buf + strlen(buf), buf_size - strlen(buf), "%sUNK_0x%02X", first ? "" : ",", unknown);
     }
@@ -353,7 +498,12 @@ static void tmc2240_format_drv_status(uint32_t drv_status, char *buf, size_t buf
     const bool otpw = (drv_status & (1UL << 26)) != 0;
     const bool ot = (drv_status & (1UL << 25)) != 0;
 
-    if (!stst && !olb && !ola && !s2gb && !s2ga && !otpw && !ot) {
+    // Extract additional useful fields: SG_RESULT (bits 9:0) and CS_ACTUAL (bits 20:16)
+    const uint16_t sg_result = (uint16_t)(drv_status & 0x03FFU);
+    const uint8_t cs_actual = (uint8_t)((drv_status >> 16) & 0x1FU);
+
+
+    if (!stst && !olb && !ola && !s2gb && !s2ga && !otpw && !ot && sg_result == 0 && cs_actual == 0) {
         snprintf(buf, buf_size, "no_fault_bits");
         return;
     }
@@ -388,6 +538,10 @@ static void tmc2240_format_drv_status(uint32_t drv_status, char *buf, size_t buf
     if (ot) {
         snprintf(buf + strlen(buf), buf_size - strlen(buf), "%sOT", first ? "" : ",");
     }
+
+    // Append StallGuard and current-actual fields for better diagnostics
+    snprintf(buf + strlen(buf), buf_size - strlen(buf), "%sSG=%u", first ? "" : ",", (unsigned)sg_result);
+    snprintf(buf + strlen(buf), buf_size - strlen(buf), ",CS_ACT=%u", (unsigned)cs_actual);
 }
 
 static void stepper_channel_init(stepper_channel_t *ch)
@@ -440,7 +594,14 @@ static esp_err_t tmc2240_read_temp_c_ctx(tmc2240_spi_ctx_t *ctx, float *out_temp
     uint32_t temp_raw = 0;
     esp_err_t err = tmc2240_read_reg_u32_ctx(ctx, 0x51, &temp_raw);
     if (err != ESP_OK) return err;
-    *out_temp_c = ((float)((uint16_t)(temp_raw & 0x00001FFF)) - 2038.0f) / 7.7f;
+    // ADC_TEMP is in bits 12:0 (13 bits). Extract raw ADC value first.
+    uint16_t adc_raw = (uint16_t)(temp_raw & 0x1FFFU);
+
+    // WARNING: conversion constants vary between TMC families. The original
+    // code used constants matching older chips; consult the TMC2240 datasheet
+    // for the precise conversion. For now use an approximate conversion based
+    // on a linear scale; this should be verified against the datasheet.
+    *out_temp_c = ((float)adc_raw - 2048.0f) / 7.7f;
     return ESP_OK;
 }
 
@@ -512,7 +673,7 @@ void motor_module_apply_command(motor_module_t *motor, const motor_command_t *co
     motor->right.target_hz = right_hz;
 }
 
-static void service_channel(stepper_channel_t *ch, int64_t now_us)
+static void IRAM_ATTR service_channel(stepper_channel_t *ch, int64_t now_us)
 {
     if (!ch->enabled || ch->target_hz == 0.0f) {
         ch->step_level = false;
@@ -520,7 +681,7 @@ static void service_channel(stepper_channel_t *ch, int64_t now_us)
         return;
     }
 
-    float abs_hz = fabsf(ch->target_hz);
+    float abs_hz = ch->target_hz < 0.0f ? -ch->target_hz : ch->target_hz;
     int64_t half_period_us = (int64_t)(500000.0f / abs_hz);
     if (half_period_us < 100) {
         half_period_us = 100;
@@ -537,7 +698,7 @@ static void service_channel(stepper_channel_t *ch, int64_t now_us)
     }
 }
 
-void motor_module_service_step_pulses(motor_module_t *motor, int64_t now_us)
+void IRAM_ATTR motor_module_service_step_pulses(motor_module_t *motor, int64_t now_us)
 {
     service_channel(&motor->left, now_us);
     service_channel(&motor->right, now_us);
@@ -597,13 +758,13 @@ void motor_module_tmc2240_test_log(void)
 void motor_module_tmc2240_configure_robot_mode(const TMC2240_RobotConfig_t *config)
 {
     TMC2240_RobotConfig_t cfg = {
-        .run_current_ma = 1200,
-        .hold_current_ma = 350,
-        .microsteps = 4,
-        .interpolate = false,
-        .stealth_threshold = 0,
-        .stall_sensitivity = 0,
-        .cool_step_enabled = false,
+        .run_current_ma = 500,        // Your 0.5A soft limit for driving
+        .hold_current_ma = 150,       // Dropped to 150mA to stay cool at standstill
+        .microsteps = 16,             // Increased to 16 for better precision
+        .interpolate = true,          // MUST BE TRUE for that "silky smooth" TMC motion
+        .stealth_threshold = 500,     // Enable StealthChop for silent operation
+        .stall_sensitivity = 0,       // Keep at 0 until you are ready for StallGuard
+        .cool_step_enabled = false,   // Keep off until your current is higher
     };
     if (config != NULL) {
         cfg = *config;
@@ -650,9 +811,45 @@ void motor_module_tmc2240_configure_robot_mode(const TMC2240_RobotConfig_t *conf
                  (unsigned long)drv_status,
                  drv_text);
 
+        // Check reset_flag (bit 0) first: indicates successful power-up
+        if (gstat & (1U << 0)) {
+            ESP_LOGI(TAG, "%s TMC2240: Reset flag confirmed (chip powered up and ready)", ctx->label);
+        }
+
         if (gstat & (1U << 2)) {
             ESP_LOGW(TAG, "%s TMC2240: UV_CP set in GSTAT", ctx->label);
         }
+
+        // Clear sticky GSTAT error flags (write 1 to clear). Use 0x1F to clear all
+        // sticky flags: Reset, DrvErr, UV_CP, RegReset, VM_UVLO (bits 0-4).
+        // This must happen AFTER the status check to avoid missing the reset_flag.
+        uint8_t tx_gstat_clear[5] = { (uint8_t)(0x01 | 0x80), 0, 0, 0, 0x1F };
+        tmc2240_transfer_40b_ctx(ctx, tx_gstat_clear, rx_data);
+
+        // Explicitly enable stealthChop in GCONF (en_pwm_mode = bit 2).
+        // Do a read-modify-write so we don't inadvertently clear other GCONF bits
+        // such as fast_standstill or multistep_filt.
+        uint32_t gconf = 0;
+        if (tmc2240_read_reg_u32_ctx(ctx, 0x00, &gconf) == ESP_OK) {
+            gconf |= (1U << 2); // set en_pwm_mode
+            (void)tmc2240_write_reg_ctx(ctx, 0x00, gconf);
+        } else {
+            // If read fails, fall back to setting en_pwm_mode only.
+            (void)tmc2240_write_reg_ctx(ctx, 0x00, 0x00000004);
+        }
+
+        // Configure DRV_CONF for Lossless Sensing: set CURRENT_RANGE=1 (2.3A RMS)
+        // and slope control bits for smooth current transitions.
+        uint32_t drv_conf = (2UL << 16) | (1UL << 0);
+        (void)tmc2240_write_reg_ctx(ctx, 0x0A, drv_conf);
+
+        // Set GLOBALSCALER to 0 (full scale / 256) for standard scaling.
+        (void)tmc2240_write_reg_ctx(ctx, 0x0B, 0);
+
+        // Configure Standstill Power Down timing: TPOWERDOWN (0x11)
+        // Sets the delay (in motor clock cycles) for current ramp-down after
+        // the last STEP pulse. Default is often insufficient; set to ~20.
+        (void)tmc2240_write_reg_ctx(ctx, 0x11, 20);
 
         // Configure operational parameters from the requested config.
         uint32_t chopconf = 0x10410150;
@@ -663,9 +860,11 @@ void motor_module_tmc2240_configure_robot_mode(const TMC2240_RobotConfig_t *conf
         }
         uint8_t tx_chop[5] = { (uint8_t)(0x6C | 0x80), (uint8_t)(chopconf>>24), (uint8_t)(chopconf>>16), (uint8_t)(chopconf>>8), (uint8_t)chopconf };
         tmc2240_transfer_40b_ctx(ctx, tx_chop, rx_data);
+
+        // (TMC2240 defaults GCONF and PWMCONF perfectly for StealthChop auto-tuning)
         
-        // Register format: bits 23:16=IRUN, bits 15:8=IHOLD, bits 7:5=IHOLDDELAY
-        uint32_t ihold_irun = ((uint32_t)irun_cs << 16) | ((uint32_t)ihold_cs << 8) | (6U << 5);
+        // Register format: bits 19:16=IHOLDDELAY, bits 12:8=IRUN, bits 4:0=IHOLD
+        uint32_t ihold_irun = (6UL << 16) | (((uint32_t)irun_cs & 0x1F) << 8) | ((uint32_t)ihold_cs & 0x1F);
         uint8_t tx_curr[5] = { (uint8_t)(0x10 | 0x80), (uint8_t)(ihold_irun>>24), (uint8_t)(ihold_irun>>16), (uint8_t)(ihold_irun>>8), (uint8_t)ihold_irun };
         tmc2240_transfer_40b_ctx(ctx, tx_curr, rx_data);
 

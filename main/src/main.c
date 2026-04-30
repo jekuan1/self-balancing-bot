@@ -52,8 +52,9 @@ static void control_task_fn(void *arg)
         return;
     }
 
-    runtime->motion_start_us = esp_timer_get_time();
-    runtime->last_dir_toggle_us = 0;
+    int64_t start_time = esp_timer_get_time();
+    runtime->motion_start_us = start_time;
+    runtime->last_dir_toggle_us = start_time;  // Fix: Initialize to now, not 0
     runtime->motion_stopped = false;
 
     motor_module_set_enabled(&runtime->motor_hal, true);
@@ -69,6 +70,7 @@ static void control_task_fn(void *arg)
             motor_module_apply_command(&runtime->motor_hal, &runtime->test_cmd);
             motor_module_set_enabled(&runtime->motor_hal, false);
             runtime->motion_stopped = true;
+            ESP_LOGI(TAG, "Test Complete: 10 seconds elapsed.");
         }
 
         if (!runtime->motion_stopped && (now_us - runtime->last_dir_toggle_us) >= 3000000) {
@@ -76,6 +78,7 @@ static void control_task_fn(void *arg)
             runtime->test_cmd.right_step_hz = -runtime->test_cmd.right_step_hz;
             motor_module_apply_command(&runtime->motor_hal, &runtime->test_cmd);
             runtime->last_dir_toggle_us = now_us;
+            ESP_LOGI(TAG, "Toggling direction...");
         }
 
         vTaskDelayUntil(&last_wake, pdMS_TO_TICKS(10));
@@ -90,24 +93,37 @@ static void supervisor_task_fn(void *arg)
         return;
     }
 
-    int64_t last_tmc_log_us = 0;
+    int64_t last_print_us = 0;
+    int64_t last_wait_us = 0;
 
     while (1) {
         imu_module_poll_and_log(&runtime->imu);
 
-        int64_t now_us = esp_timer_get_time();
-        if ((now_us - last_tmc_log_us) >= 1000000) {
-            motor_module_tmc2240_test_log();
-            last_tmc_log_us = now_us;
+        imu_sample_t sample;
+        if (imu_module_read_sample(&runtime->imu, &sample) == ESP_OK) {
+            int64_t now_us = esp_timer_get_time();
+            if (now_us - last_print_us >= 10000) {
+                ESP_LOGI(TAG, "Yaw: %8.3f | Pitch: %8.3f | Roll: %8.3f",
+                         (double)sample.yaw_deg,
+                         (double)sample.pitch_deg,
+                         (double)sample.roll_deg);
+                last_print_us = now_us;
+            }
+        } else {
+            int64_t now_us = esp_timer_get_time();
+            if (now_us - last_wait_us >= 1000000) {
+                ESP_LOGI(TAG, "Waiting for valid IMU orientation... (is the sensor connected?)");
+                last_wait_us = now_us;
+            }
         }
 
-        vTaskDelay(pdMS_TO_TICKS(20));
+        vTaskDelay(pdMS_TO_TICKS(10));
     }
 }
 
 void app_main(void)
 {
-    imu_module_t imu = {
+    g_runtime.imu = (imu_module_t){
         .i2c_port = I2C_NUM_0,
         .sda_io = GPIO_NUM_5,
         .scl_io = GPIO_NUM_4,
@@ -116,11 +132,12 @@ void app_main(void)
         .int_io = -1,
     };
 
-    if (imu_module_init(&imu) != ESP_OK) {
+    if (imu_module_init(&g_runtime.imu) != ESP_OK) {
         ESP_LOGW(TAG, "IMU init failed, continuing to motor test...");
     } else {
-        if (imu_module_probe(&imu, 2000)) {
-            imu_module_enable_default_reports(&imu);
+        if (imu_module_probe(&g_runtime.imu, 2000)) {
+            bno08x_enable_game_rv(10000);
+            bno08x_enable_gyroscope(10000);
             ESP_LOGI(TAG, "IMU Ready");
         }
     }
@@ -148,14 +165,13 @@ void app_main(void)
         .hold_current_ma = 200,
         .microsteps = 16,
         .interpolate = true,
-        .stealth_threshold = 500,
+        .stealth_threshold = 0,
         .stall_sensitivity = 0,
         .cool_step_enabled = false,
     };
 
     motor_module_tmc2240_configure_robot_mode(&silent_config);
 
-    g_runtime.imu = imu;
     g_runtime.motor_hal.left.step_pin = TMC_LEFT_STEP;
     g_runtime.motor_hal.left.dir_pin = TMC_LEFT_DIR;
     g_runtime.motor_hal.left.en_pin = TMC_EN;
@@ -166,8 +182,8 @@ void app_main(void)
     g_runtime.motor_hal.right.en_active_low = true;
     g_runtime.motor_hal.max_step_hz = 2000.0f;
     g_runtime.test_cmd = (motor_command_t) {
-        .left_step_hz = 300.0f,
-        .right_step_hz = 300.0f,
+        .left_step_hz = 1000.0f,
+        .right_step_hz = 1000.0f,
     };
 
     motor_module_init(&g_runtime.motor_hal);
