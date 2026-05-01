@@ -6,18 +6,31 @@
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/queue.h"
 #include "hal/imu_module.h"
 #include "hal/motor_module.h"
 
 static const char *TAG = "motor_test";
 
 typedef struct {
+    float kp;
+    float ki;
+    float kd;
+    float integral;
+    float prev_error;
+    float target_pitch;
+} pid_state_t;
+
+typedef struct {
     imu_module_t imu;
     motor_module_t motor_hal;
     motor_command_t test_cmd;
     int64_t motion_start_us;
+    TaskHandle_t imu_task;
     TaskHandle_t control_task;
     TaskHandle_t supervisor_task;
+    QueueHandle_t imu_queue;
+    pid_state_t balance_pid;
 } robot_runtime_t;
 
 static robot_runtime_t g_runtime = {0};
@@ -42,57 +55,83 @@ static robot_runtime_t g_runtime = {0};
 #define TMC_RIGHT_SPI_CS    GPIO_NUM_39
 #define TMC_RIGHT_DIAG0     GPIO_NUM_41
 
-static void control_task_fn(void *arg)
+static void imu_task_fn(void *arg)
 {
     robot_runtime_t *runtime = (robot_runtime_t *)arg;
-    if (runtime == NULL) {
+    if (runtime == NULL || runtime->imu_queue == NULL) {
         vTaskDelete(NULL);
         return;
     }
 
-    int64_t start_time = esp_timer_get_time();
-    runtime->motion_start_us = start_time;
+    TickType_t last_wake = xTaskGetTickCount();
+    while (1) {
+        if (runtime->imu.i2c_dev != NULL) {
+            // Poll the IMU. In the future, this can be triggered by a hardware INT pin.
+            imu_module_poll_and_log(&runtime->imu);
+            
+            imu_sample_t sample;
+            if (imu_module_read_sample(&runtime->imu, &sample) == ESP_OK) {
+                // Send the sample to the control task, overwriting if queue is full
+                xQueueOverwrite(runtime->imu_queue, &sample);
+            }
+        }
+        // Poll at 100Hz
+        vTaskDelayUntil(&last_wake, pdMS_TO_TICKS(10));
+    }
+}
+
+static void control_task_fn(void *arg)
+{
+    robot_runtime_t *runtime = (robot_runtime_t *)arg;
+    if (runtime == NULL || runtime->imu_queue == NULL) {
+        vTaskDelete(NULL);
+        return;
+    }
 
     motor_module_set_enabled(&runtime->motor_hal, true);
-    ESP_LOGI(TAG, "AT#1: holding standstill for StealthChop2 tuning before first move...");
-    vTaskDelay(pdMS_TO_TICKS(150));
+    ESP_LOGI(TAG, "Control Task Started. Waiting for IMU data...");
 
-    runtime->motion_start_us = esp_timer_get_time();
-    
-    // Phase 1: Left motor only for 3 seconds
-    ESP_LOGI(TAG, "Phase 1: Running LEFT motor for 3 seconds...");
-    runtime->test_cmd.left_step_hz = 1000.0f;
-    runtime->test_cmd.right_step_hz = 0.0f;
-    motor_module_apply_command(&runtime->motor_hal, &runtime->test_cmd);
+    // Motor and Pitch polarity variables. Flip to -1.0f if robot drives backwards or falls over.
+    const float PITCH_POLARITY = 1.0f;
+    const float MOTOR_POLARITY = 1.0f;
 
-    TickType_t last_wake = xTaskGetTickCount();
-    int phase = 1;
-    
     while (1) {
-        int64_t now_us = esp_timer_get_time();
-        int64_t elapsed_us = now_us - runtime->motion_start_us;
-
-        if (phase == 1 && elapsed_us >= 3000000) {
-            // Switch to Phase 2: Right motor only for 3 seconds
-            ESP_LOGI(TAG, "Phase 1 complete. Phase 2: Running RIGHT motor for 3 seconds...");
-            runtime->test_cmd.left_step_hz = 0.0f;
-            runtime->test_cmd.right_step_hz = 1000.0f;
+        imu_sample_t sample;
+        // Block indefinitely until new IMU data arrives from the IMU task
+        if (xQueueReceive(runtime->imu_queue, &sample, portMAX_DELAY) == pdTRUE) {
+            
+            // 1. Get current pitch
+            float current_pitch = sample.pitch_deg * PITCH_POLARITY;
+            
+            // 2. Calculate error
+            float error = runtime->balance_pid.target_pitch - current_pitch;
+            
+            // 3. PID Math (assuming fixed dt based on IMU poll rate, ~0.01s)
+            float dt = 0.01f;
+            
+            float p_out = runtime->balance_pid.kp * error;
+            
+            runtime->balance_pid.integral += error * dt;
+            // Anti-windup (limit integral to +/- 1000 for now)
+            if (runtime->balance_pid.integral > 1000.0f) runtime->balance_pid.integral = 1000.0f;
+            if (runtime->balance_pid.integral < -1000.0f) runtime->balance_pid.integral = -1000.0f;
+            float i_out = runtime->balance_pid.ki * runtime->balance_pid.integral;
+            
+            float derivative = (error - runtime->balance_pid.prev_error) / dt;
+            float d_out = runtime->balance_pid.kd * derivative;
+            
+            runtime->balance_pid.prev_error = error;
+            
+            float total_output = p_out + i_out + d_out;
+            
+            // 4. Convert PID output to motor speed (Hz)
+            float motor_hz = total_output * MOTOR_POLARITY;
+            
+            // 5. Apply to motors (Assuming both motors face same direction relative to body)
+            runtime->test_cmd.left_step_hz = motor_hz;
+            runtime->test_cmd.right_step_hz = motor_hz; 
             motor_module_apply_command(&runtime->motor_hal, &runtime->test_cmd);
-            phase = 2;
-            runtime->motion_start_us = now_us;
         }
-
-        if (phase == 2 && (now_us - runtime->motion_start_us) >= 3000000) {
-            // Stop both motors
-            ESP_LOGI(TAG, "Phase 2 complete. Stopping both motors.");
-            runtime->test_cmd.left_step_hz = 0.0f;
-            runtime->test_cmd.right_step_hz = 0.0f;
-            motor_module_apply_command(&runtime->motor_hal, &runtime->test_cmd);
-            phase = 3;
-            ESP_LOGI(TAG, "Test Complete: Right 3s + Left 3s done. Motors stopped.");
-        }
-
-        vTaskDelayUntil(&last_wake, pdMS_TO_TICKS(10));
     }
 }
 
@@ -104,34 +143,15 @@ static void supervisor_task_fn(void *arg)
         return;
     }
 
-    int64_t last_print_us = 0;
-    int64_t last_wait_us = 0;
+    TickType_t last_wake = xTaskGetTickCount();
 
     while (1) {
-        if (runtime->imu.i2c_dev != NULL) {
-            imu_module_poll_and_log(&runtime->imu);
-        }
+        // Here we can eventually handle WiFi UDP, steering inputs, etc.
+        // For now, just log TMC temps periodically
+        motor_module_tmc2240_test_log();
 
-        imu_sample_t sample;
-        if (imu_module_read_sample(&runtime->imu, &sample) == ESP_OK) {
-            int64_t now_us = esp_timer_get_time();
-            if (now_us - last_print_us >= 1000000) {
-                // ESP_LOGI(TAG, "Yaw: %8.3f | Pitch: %8.3f | Roll: %8.3f",
-                //          (double)sample.yaw_deg,
-                //          (double)sample.pitch_deg,
-                //          (double)sample.roll_deg);
-                motor_module_tmc2240_test_log();
-                last_print_us = now_us;
-            }
-        } else {
-            int64_t now_us = esp_timer_get_time();
-            if (now_us - last_wait_us >= 1000000) {
-                ESP_LOGI(TAG, "Waiting for valid IMU orientation... (is the sensor connected?)");
-                last_wait_us = now_us;
-            }
-        }
-
-        vTaskDelay(pdMS_TO_TICKS(10));
+        // Print stats at 1Hz
+        vTaskDelayUntil(&last_wake, pdMS_TO_TICKS(1000));
     }
 }
 
@@ -200,11 +220,33 @@ void app_main(void)
     motor_module_init(&g_runtime.motor_hal);
     motor_module_set_enabled(&g_runtime.motor_hal, false);
 
+    // Initialize IMU Queue (Length 1, so we always only process the newest data)
+    g_runtime.imu_queue = xQueueCreate(1, sizeof(imu_sample_t));
+
+    // Initialize PID config
+    g_runtime.balance_pid.kp = 20.0f;  // Tuning placeholders
+    g_runtime.balance_pid.ki = 0.0f;
+    g_runtime.balance_pid.kd = 0.0f;
+    g_runtime.balance_pid.integral = 0.0f;
+    g_runtime.balance_pid.prev_error = 0.0f;
+    g_runtime.balance_pid.target_pitch = 0.0f; // Stand perfectly upright
+
+    if (xTaskCreatePinnedToCore(imu_task_fn,
+                                "imu_core0",
+                                4096,
+                                &g_runtime,
+                                4,
+                                &g_runtime.imu_task,
+                                0) != pdPASS) {
+        ESP_LOGE(TAG, "Failed to create IMU task on Core 0");
+        return;
+    }
+
     if (xTaskCreatePinnedToCore(control_task_fn,
                                 "control_core1",
                                 4096,
                                 &g_runtime,
-                                5,
+                                5, // Highest priority
                                 &g_runtime.control_task,
                                 1) != pdPASS) {
         ESP_LOGE(TAG, "Failed to create control task on Core 1");
@@ -215,7 +257,7 @@ void app_main(void)
                                 "supervisor_core0",
                                 4096,
                                 &g_runtime,
-                                2,
+                                2, // Low priority
                                 &g_runtime.supervisor_task,
                                 0) != pdPASS) {
         ESP_LOGE(TAG, "Failed to create supervisor task on Core 0");
