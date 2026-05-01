@@ -196,6 +196,10 @@ static esp_err_t tmc2240_read_reg_u32_ctx(tmc2240_spi_ctx_t *ctx, uint8_t reg_ad
     uint8_t tx_cmd[5] = {0};
     uint8_t rx_cmd[5] = {0};
     uint8_t rx_data[5] = {0};
+
+    // TMC2240 readback is delayed by one SPI frame.
+    // This helper intentionally performs the address frame plus the dummy frame
+    // so callers always get the value for the register they asked for.
     esp_err_t err = tmc2240_read_reg_raw_ctx(ctx, reg_addr, tx_cmd, rx_cmd, rx_data);
     if (err != ESP_OK) return err;
     
@@ -609,11 +613,11 @@ static esp_err_t tmc2240_read_temp_c_ctx(tmc2240_spi_ctx_t *ctx, float *out_temp
     // ADC_TEMP is in bits 12:0 (13 bits). Extract raw ADC value first.
     uint16_t adc_raw = (uint16_t)(temp_raw & 0x1FFFU);
 
-    // WARNING: conversion constants vary between TMC families. The original
-    // code used constants matching older chips; consult the TMC2240 datasheet
-    // for the precise conversion. For now use an approximate conversion based
-    // on a linear scale; this should be verified against the datasheet.
-    *out_temp_c = ((float)adc_raw - 2048.0f) / 7.7f;
+    // TMC2240 ADC_TEMP linearized conversion (typical):
+    // T(C) = (ADC_RAW - 2038) / 7.7
+    // Keep this as a typical calibration point unless board-level calibration
+    // data is available for a more accurate offset.
+    *out_temp_c = ((float)adc_raw - 2038.0f) / 7.7f;
     return ESP_OK;
 }
 
@@ -770,32 +774,11 @@ esp_err_t motor_module_tmc2240_spi_init(int spi_host,
                                         int mosi_pin,
                                         int miso_pin,
                                         int cs_pin,
-                                        int spi_clock_hz)
+                                        int spi_clock_hz,
+                                        bool right_ctx)
 {
-    return tmc2240_spi_init_ctx(&s_tmc2240_left_ctx, spi_host, sclk_pin, mosi_pin, miso_pin, cs_pin, spi_clock_hz);
-}
-
-esp_err_t motor_module_tmc2240_right_spi_init(int spi_host,
-                                              int sclk_pin,
-                                              int mosi_pin,
-                                              int miso_pin,
-                                              int cs_pin,
-                                              int spi_clock_hz)
-{
-    return tmc2240_spi_init_ctx(&s_tmc2240_right_ctx, spi_host, sclk_pin, mosi_pin, miso_pin, cs_pin, spi_clock_hz);
-}
-
-esp_err_t motor_module_tmc2240_write_reg(uint8_t reg_addr, uint32_t value)
-{
-    return tmc2240_write_reg_ctx(&s_tmc2240_left_ctx, reg_addr, value);
-}
-
-esp_err_t motor_module_tmc2240_read_reg(uint8_t reg_addr, uint32_t *value_out)
-{
-    if (value_out == NULL) {
-        return ESP_ERR_INVALID_ARG;
-    }
-    return tmc2240_read_reg_u32_ctx(&s_tmc2240_left_ctx, reg_addr, value_out);
+    tmc2240_spi_ctx_t *ctx = right_ctx ? &s_tmc2240_right_ctx : &s_tmc2240_left_ctx;
+    return tmc2240_spi_init_ctx(ctx, spi_host, sclk_pin, mosi_pin, miso_pin, cs_pin, spi_clock_hz);
 }
 
 void motor_module_tmc2240_test_log(void)
@@ -855,6 +838,58 @@ void motor_module_tmc2240_test_log(void)
                  esp_err_to_name(rcurr_err),
                  esp_err_to_name(rpwm_err));
     }
+}
+
+void motor_module_tmc2240_debug_left(void)
+{
+    uint32_t drv_status, gstat, ioin, drv_conf;
+
+    // Read the critical diagnostic registers
+    tmc2240_read_reg_u32_ctx(&s_tmc2240_left_ctx, 0x6F, &drv_status); // DRV_STATUS
+    tmc2240_read_reg_u32_ctx(&s_tmc2240_left_ctx, 0x01, &gstat);      // GSTAT
+    tmc2240_read_reg_u32_ctx(&s_tmc2240_left_ctx, 0x04, &ioin);       // IOIN
+    tmc2240_read_reg_u32_ctx(&s_tmc2240_left_ctx, 0x0A, &drv_conf);   // DRV_CONF
+
+    ESP_LOGI("DEBUG", "--- LEFT MOTOR HARDWARE TRACE ---");
+    ESP_LOGI("DEBUG", "DRV_STATUS: 0x%08lX", (unsigned long)drv_status);
+    ESP_LOGI("DEBUG", "  > Open Load A: %s", (drv_status & (1UL<<29)) ? "YES" : "no");
+    ESP_LOGI("DEBUG", "  > Open Load B: %s", (drv_status & (1UL<<30)) ? "YES" : "no");
+    ESP_LOGI("DEBUG", "  > CS_ACTUAL:   %u", (unsigned)((drv_status >> 16) & 0x1F));
+
+    ESP_LOGI("DEBUG", "IOIN (Input Pins): 0x%08lX", (unsigned long)ioin);
+    ESP_LOGI("DEBUG", "  > DRV_EN Pin:  %s", (ioin & (1UL<<0)) ? "HIGH (Disabled)" : "LOW (Enabled)");
+    ESP_LOGI("DEBUG", "  > STEP Pin:    %s", (ioin & (1UL<<7)) ? "High" : "Low");
+    ESP_LOGI("DEBUG", "  > DIR Pin:     %s", (ioin & (1UL<<8)) ? "High" : "Low");
+
+    ESP_LOGI("DEBUG", "GSTAT: 0x%02X", (unsigned)(gstat & 0xFF));
+    ESP_LOGI("DEBUG", "DRV_CONF: 0x%08lX", (unsigned long)drv_conf);
+    ESP_LOGI("DEBUG", "  > Current Range: %u", (unsigned)((drv_conf >> 16) & 0x03));
+}
+
+void motor_module_tmc2240_debug_right(void)
+{
+    uint32_t drv_status, gstat, ioin, drv_conf;
+
+    // Read the critical diagnostic registers
+    tmc2240_read_reg_u32_ctx(&s_tmc2240_right_ctx, 0x6F, &drv_status); // DRV_STATUS
+    tmc2240_read_reg_u32_ctx(&s_tmc2240_right_ctx, 0x01, &gstat);      // GSTAT
+    tmc2240_read_reg_u32_ctx(&s_tmc2240_right_ctx, 0x04, &ioin);       // IOIN
+    tmc2240_read_reg_u32_ctx(&s_tmc2240_right_ctx, 0x0A, &drv_conf);   // DRV_CONF
+
+    ESP_LOGI("DEBUG", "--- RIGHT MOTOR HARDWARE TRACE ---");
+    ESP_LOGI("DEBUG", "DRV_STATUS: 0x%08lX", (unsigned long)drv_status);
+    ESP_LOGI("DEBUG", "  > Open Load A: %s", (drv_status & (1UL<<29)) ? "YES" : "no");
+    ESP_LOGI("DEBUG", "  > Open Load B: %s", (drv_status & (1UL<<30)) ? "YES" : "no");
+    ESP_LOGI("DEBUG", "  > CS_ACTUAL:   %u", (unsigned)((drv_status >> 16) & 0x1F));
+
+    ESP_LOGI("DEBUG", "IOIN (Input Pins): 0x%08lX", (unsigned long)ioin);
+    ESP_LOGI("DEBUG", "  > DRV_EN Pin:  %s", (ioin & (1UL<<0)) ? "HIGH (Disabled)" : "LOW (Enabled)");
+    ESP_LOGI("DEBUG", "  > STEP Pin:    %s", (ioin & (1UL<<7)) ? "High" : "Low");
+    ESP_LOGI("DEBUG", "  > DIR Pin:     %s", (ioin & (1UL<<8)) ? "High" : "Low");
+
+    ESP_LOGI("DEBUG", "GSTAT: 0x%02X", (unsigned)(gstat & 0xFF));
+    ESP_LOGI("DEBUG", "DRV_CONF: 0x%08lX", (unsigned long)drv_conf);
+    ESP_LOGI("DEBUG", "  > Current Range: %u", (unsigned)((drv_conf >> 16) & 0x03));
 }
 
 void motor_module_tmc2240_configure_robot_mode(const TMC2240_RobotConfig_t *config)
@@ -929,23 +964,43 @@ void motor_module_tmc2240_configure_robot_mode(const TMC2240_RobotConfig_t *conf
         uint8_t tx_gstat_clear[5] = { (uint8_t)(0x01 | 0x80), 0, 0, 0, 0x1F };
         tmc2240_transfer_40b_ctx(ctx, tx_gstat_clear, rx_data);
 
-        // Explicitly enable stealthChop in GCONF (en_pwm_mode = bit 2).
-        // Do a read-modify-write so we don't inadvertently clear other GCONF bits
-        // such as fast_standstill or multistep_filt.
+        // Explicitly enable stealthChop in GCONF (en_pwm_mode = bit 0).
+        // Do a read-modify-write so we don't inadvertently clear other GCONF bits.
         uint32_t gconf = 0;
         if (tmc2240_read_reg_u32_ctx(ctx, 0x00, &gconf) == ESP_OK) {
-            gconf |= (1U << 2); // set en_pwm_mode
+            gconf |= (1U << 0); // set en_pwm_mode
             (void)tmc2240_write_reg_ctx(ctx, 0x00, gconf);
         } else {
             // If read fails, fall back to setting en_pwm_mode only.
-            (void)tmc2240_write_reg_ctx(ctx, 0x00, 0x00000004);
+            (void)tmc2240_write_reg_ctx(ctx, 0x00, 0x00000001);
         }
 
-        // Configure DRV_CONF for integrated current sensing.
-        // Use the lowest range that still covers the requested run current so
-        // the internal ADC has the best resolution.
-        uint32_t drv_conf = ((uint32_t)current_range << 16) | (1UL << 0);
-        (void)tmc2240_write_reg_ctx(ctx, 0x0A, drv_conf);
+        // Configure DRV_CONF using only CURRENT_RANGE in bits 1:0.
+        // This keeps the driver's current scaling aligned with the configured run current.
+        const uint32_t drv_conf_value = ((uint32_t)(current_range & 0x03U));
+        (void)tmc2240_write_reg_ctx(ctx, 0x0A, drv_conf_value);
+
+        // Read back the register immediately to prove the chip accepted the setting.
+        esp_rom_delay_us(50);
+        uint32_t drv_conf_read = 0;
+        esp_err_t drv_conf_err = tmc2240_read_reg_u32_ctx(ctx, 0x0A, &drv_conf_read);
+        const uint32_t drv_conf_read_current_range = drv_conf_read & 0x03U;
+        if (drv_conf_err != ESP_OK || drv_conf_read_current_range != (current_range & 0x03U)) {
+            ESP_LOGE(TAG,
+                     "%s CONFIG FAILED: Wrote CURRENT_RANGE=%u (DRV_CONF=0x%08lX), Read DRV_CONF=0x%08lX (CURRENT_RANGE=%u, %s)",
+                     ctx->label,
+                     (unsigned)current_range,
+                     (unsigned long)drv_conf_value,
+                     (unsigned long)drv_conf_read,
+                     (unsigned)drv_conf_read_current_range,
+                     esp_err_to_name(drv_conf_err));
+        } else {
+            ESP_LOGI(TAG,
+                     "%s CONFIG SUCCESS: CURRENT_RANGE=%u (DRV_CONF=0x%08lX)",
+                     ctx->label,
+                     (unsigned)current_range,
+                     (unsigned long)drv_conf_read);
+        }
 
         // Configure Standstill Power Down timing: TPOWERDOWN (0x11)
         // This keeps the bridge powered while stepping stops, letting the

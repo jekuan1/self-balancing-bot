@@ -16,8 +16,6 @@ typedef struct {
     motor_module_t motor_hal;
     motor_command_t test_cmd;
     int64_t motion_start_us;
-    int64_t last_dir_toggle_us;
-    bool motion_stopped;
     TaskHandle_t control_task;
     TaskHandle_t supervisor_task;
 } robot_runtime_t;
@@ -35,7 +33,7 @@ static robot_runtime_t g_runtime = {0};
 
 #define TMC_LEFT_STEP       GPIO_NUM_8
 #define TMC_LEFT_DIR        GPIO_NUM_13
-#define TMC_LEFT_SPI_CS     GPIO_NUM_12
+#define TMC_LEFT_SPI_CS     GPIO_NUM_21
 #define TMC_LEFT_DIAG0      GPIO_NUM_6
 
 // ============== RIGHT MOTOR PINS ==============
@@ -54,36 +52,44 @@ static void control_task_fn(void *arg)
 
     int64_t start_time = esp_timer_get_time();
     runtime->motion_start_us = start_time;
-    runtime->last_dir_toggle_us = start_time;  // Fix: Initialize to now, not 0
-    runtime->motion_stopped = false;
 
     motor_module_set_enabled(&runtime->motor_hal, true);
     ESP_LOGI(TAG, "AT#1: holding standstill for StealthChop2 tuning before first move...");
     vTaskDelay(pdMS_TO_TICKS(150));
 
     runtime->motion_start_us = esp_timer_get_time();
-    runtime->last_dir_toggle_us = runtime->motion_start_us;
+    
+    // Phase 1: Left motor only for 3 seconds
+    ESP_LOGI(TAG, "Phase 1: Running LEFT motor for 3 seconds...");
+    runtime->test_cmd.left_step_hz = 1000.0f;
+    runtime->test_cmd.right_step_hz = 0.0f;
     motor_module_apply_command(&runtime->motor_hal, &runtime->test_cmd);
-    ESP_LOGI(TAG, "AT#2: starting first move after tuning delay");
 
     TickType_t last_wake = xTaskGetTickCount();
+    int phase = 1;
+    
     while (1) {
         int64_t now_us = esp_timer_get_time();
+        int64_t elapsed_us = now_us - runtime->motion_start_us;
 
-        if (!runtime->motion_stopped && (now_us - runtime->motion_start_us) >= 10000000) {
+        if (phase == 1 && elapsed_us >= 3000000) {
+            // Switch to Phase 2: Right motor only for 3 seconds
+            ESP_LOGI(TAG, "Phase 1 complete. Phase 2: Running RIGHT motor for 3 seconds...");
+            runtime->test_cmd.left_step_hz = 0.0f;
+            runtime->test_cmd.right_step_hz = 1000.0f;
+            motor_module_apply_command(&runtime->motor_hal, &runtime->test_cmd);
+            phase = 2;
+            runtime->motion_start_us = now_us;
+        }
+
+        if (phase == 2 && (now_us - runtime->motion_start_us) >= 3000000) {
+            // Stop both motors
+            ESP_LOGI(TAG, "Phase 2 complete. Stopping both motors.");
             runtime->test_cmd.left_step_hz = 0.0f;
             runtime->test_cmd.right_step_hz = 0.0f;
             motor_module_apply_command(&runtime->motor_hal, &runtime->test_cmd);
-            runtime->motion_stopped = true;
-            ESP_LOGI(TAG, "Test Complete: 10 seconds elapsed; motor driver remains enabled for standstill current control.");
-        }
-
-        if (!runtime->motion_stopped && (now_us - runtime->last_dir_toggle_us) >= 3000000) {
-            runtime->test_cmd.left_step_hz = -runtime->test_cmd.left_step_hz;
-            runtime->test_cmd.right_step_hz = -runtime->test_cmd.right_step_hz;
-            motor_module_apply_command(&runtime->motor_hal, &runtime->test_cmd);
-            runtime->last_dir_toggle_us = now_us;
-            ESP_LOGI(TAG, "Toggling direction...");
+            phase = 3;
+            ESP_LOGI(TAG, "Test Complete: Right 3s + Left 3s done. Motors stopped.");
         }
 
         vTaskDelayUntil(&last_wake, pdMS_TO_TICKS(10));
@@ -115,6 +121,8 @@ static void supervisor_task_fn(void *arg)
                 //          (double)sample.pitch_deg,
                 //          (double)sample.roll_deg);
                 motor_module_tmc2240_test_log();
+                motor_module_tmc2240_debug_left();
+                motor_module_tmc2240_debug_right();
                 last_print_us = now_us;
             }
         } else {
@@ -155,22 +163,24 @@ void app_main(void)
                                       TMC_SPI_MOSI,
                                       TMC_SPI_MISO,
                                       TMC_LEFT_SPI_CS,
-                                      1000000) != ESP_OK) {
+                                      1000000,
+                                      false) != ESP_OK) {
         ESP_LOGE(TAG, "LEFT TMC2240 SPI init failed");
     }
 
-    if (motor_module_tmc2240_right_spi_init(TMC_SPI_HOST,
-                                            TMC_SPI_SCLK,
-                                            TMC_SPI_MOSI,
-                                            TMC_SPI_MISO,
-                                            TMC_RIGHT_SPI_CS,
-                                            1000000) != ESP_OK) {
+    if (motor_module_tmc2240_spi_init(TMC_SPI_HOST,
+                                      TMC_SPI_SCLK,
+                                      TMC_SPI_MOSI,
+                                      TMC_SPI_MISO,
+                                      TMC_RIGHT_SPI_CS,
+                                      1000000,
+                                      true) != ESP_OK) {
         ESP_LOGE(TAG, "RIGHT TMC2240 SPI init failed");
     }
 
     TMC2240_RobotConfig_t silent_config = {
-        .run_current_ma = 500,
-        .hold_current_ma = 100,
+        .run_current_ma = 800,
+        .hold_current_ma = 200,
         .microsteps = 16,
         .interpolate = true,
         .stealth_threshold = 500,
@@ -189,11 +199,6 @@ void app_main(void)
     g_runtime.motor_hal.right.en_pin = TMC_EN;
     g_runtime.motor_hal.right.en_active_low = true;
     g_runtime.motor_hal.max_step_hz = 2000.0f;
-    g_runtime.test_cmd = (motor_command_t) {
-        .left_step_hz = 1000.0f,
-        .right_step_hz = 1000.0f,
-    };
-
     motor_module_init(&g_runtime.motor_hal);
     motor_module_set_enabled(&g_runtime.motor_hal, false);
 
