@@ -121,8 +121,6 @@ static void supervisor_task_fn(void *arg)
                 //          (double)sample.pitch_deg,
                 //          (double)sample.roll_deg);
                 motor_module_tmc2240_test_log();
-                motor_module_tmc2240_debug_left();
-                motor_module_tmc2240_debug_right();
                 last_print_us = now_us;
             }
         } else {

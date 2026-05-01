@@ -840,58 +840,6 @@ void motor_module_tmc2240_test_log(void)
     }
 }
 
-void motor_module_tmc2240_debug_left(void)
-{
-    uint32_t drv_status, gstat, ioin, drv_conf;
-
-    // Read the critical diagnostic registers
-    tmc2240_read_reg_u32_ctx(&s_tmc2240_left_ctx, 0x6F, &drv_status); // DRV_STATUS
-    tmc2240_read_reg_u32_ctx(&s_tmc2240_left_ctx, 0x01, &gstat);      // GSTAT
-    tmc2240_read_reg_u32_ctx(&s_tmc2240_left_ctx, 0x04, &ioin);       // IOIN
-    tmc2240_read_reg_u32_ctx(&s_tmc2240_left_ctx, 0x0A, &drv_conf);   // DRV_CONF
-
-    ESP_LOGI("DEBUG", "--- LEFT MOTOR HARDWARE TRACE ---");
-    ESP_LOGI("DEBUG", "DRV_STATUS: 0x%08lX", (unsigned long)drv_status);
-    ESP_LOGI("DEBUG", "  > Open Load A: %s", (drv_status & (1UL<<29)) ? "YES" : "no");
-    ESP_LOGI("DEBUG", "  > Open Load B: %s", (drv_status & (1UL<<30)) ? "YES" : "no");
-    ESP_LOGI("DEBUG", "  > CS_ACTUAL:   %u", (unsigned)((drv_status >> 16) & 0x1F));
-
-    ESP_LOGI("DEBUG", "IOIN (Input Pins): 0x%08lX", (unsigned long)ioin);
-    ESP_LOGI("DEBUG", "  > DRV_EN Pin:  %s", (ioin & (1UL<<0)) ? "HIGH (Disabled)" : "LOW (Enabled)");
-    ESP_LOGI("DEBUG", "  > STEP Pin:    %s", (ioin & (1UL<<7)) ? "High" : "Low");
-    ESP_LOGI("DEBUG", "  > DIR Pin:     %s", (ioin & (1UL<<8)) ? "High" : "Low");
-
-    ESP_LOGI("DEBUG", "GSTAT: 0x%02X", (unsigned)(gstat & 0xFF));
-    ESP_LOGI("DEBUG", "DRV_CONF: 0x%08lX", (unsigned long)drv_conf);
-    ESP_LOGI("DEBUG", "  > Current Range: %u", (unsigned)((drv_conf >> 16) & 0x03));
-}
-
-void motor_module_tmc2240_debug_right(void)
-{
-    uint32_t drv_status, gstat, ioin, drv_conf;
-
-    // Read the critical diagnostic registers
-    tmc2240_read_reg_u32_ctx(&s_tmc2240_right_ctx, 0x6F, &drv_status); // DRV_STATUS
-    tmc2240_read_reg_u32_ctx(&s_tmc2240_right_ctx, 0x01, &gstat);      // GSTAT
-    tmc2240_read_reg_u32_ctx(&s_tmc2240_right_ctx, 0x04, &ioin);       // IOIN
-    tmc2240_read_reg_u32_ctx(&s_tmc2240_right_ctx, 0x0A, &drv_conf);   // DRV_CONF
-
-    ESP_LOGI("DEBUG", "--- RIGHT MOTOR HARDWARE TRACE ---");
-    ESP_LOGI("DEBUG", "DRV_STATUS: 0x%08lX", (unsigned long)drv_status);
-    ESP_LOGI("DEBUG", "  > Open Load A: %s", (drv_status & (1UL<<29)) ? "YES" : "no");
-    ESP_LOGI("DEBUG", "  > Open Load B: %s", (drv_status & (1UL<<30)) ? "YES" : "no");
-    ESP_LOGI("DEBUG", "  > CS_ACTUAL:   %u", (unsigned)((drv_status >> 16) & 0x1F));
-
-    ESP_LOGI("DEBUG", "IOIN (Input Pins): 0x%08lX", (unsigned long)ioin);
-    ESP_LOGI("DEBUG", "  > DRV_EN Pin:  %s", (ioin & (1UL<<0)) ? "HIGH (Disabled)" : "LOW (Enabled)");
-    ESP_LOGI("DEBUG", "  > STEP Pin:    %s", (ioin & (1UL<<7)) ? "High" : "Low");
-    ESP_LOGI("DEBUG", "  > DIR Pin:     %s", (ioin & (1UL<<8)) ? "High" : "Low");
-
-    ESP_LOGI("DEBUG", "GSTAT: 0x%02X", (unsigned)(gstat & 0xFF));
-    ESP_LOGI("DEBUG", "DRV_CONF: 0x%08lX", (unsigned long)drv_conf);
-    ESP_LOGI("DEBUG", "  > Current Range: %u", (unsigned)((drv_conf >> 16) & 0x03));
-}
-
 void motor_module_tmc2240_configure_robot_mode(const TMC2240_RobotConfig_t *config)
 {
     TMC2240_RobotConfig_t cfg = {
