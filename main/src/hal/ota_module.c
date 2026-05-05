@@ -1,11 +1,40 @@
 #include "hal/ota_module.h"
 #include <string.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 #include "esp_log.h"
 #include "esp_http_server.h"
 #include "esp_ota_ops.h"
 #include "esp_system.h"
 
 static const char *TAG = "ota_module";
+
+static const char *OTA_UPLOAD_HTML =
+    "<!doctype html><html><head><meta charset=\"utf-8\">"
+    "<title>BalanceBot OTA</title></head><body>"
+    "<h2>BalanceBot OTA Update</h2>"
+    "<p>Select a compiled firmware .bin and upload.</p>"
+    "<form method=\"POST\" action=\"/update\" enctype=\"application/octet-stream\">"
+    "<input type=\"file\" id=\"fw\" />"
+    "<button type=\"button\" onclick=\"upload()\">Upload</button>"
+    "</form>"
+    "<pre id=\"log\"></pre>"
+    "<script>"
+    "async function upload(){"
+    "const f=document.getElementById('fw').files[0];"
+    "if(!f){alert('Select a .bin first');return;}"
+    "document.getElementById('log').textContent='Uploading...';"
+    "const r=await fetch('/update',{method:'POST',headers:{'Content-Type':'application/octet-stream'},body:f});"
+    "const t=await r.text();"
+    "document.getElementById('log').textContent='HTTP '+r.status+'\\n'+t;"
+    "}"
+    "</script></body></html>";
+
+static esp_err_t index_get_handler(httpd_req_t *req)
+{
+    httpd_resp_set_type(req, "text/html");
+    return httpd_resp_send(req, OTA_UPLOAD_HTML, HTTPD_RESP_USE_STRLEN);
+}
 
 /* 
  * HTTP POST Handler for /update
@@ -34,6 +63,7 @@ static esp_err_t update_post_handler(httpd_req_t *req)
     char buf[1024];
     int remaining = req->content_len;
     int received;
+    int last_percent = -1;
 
     while (remaining > 0) {
         received = httpd_req_recv(req, buf, sizeof(buf));
@@ -55,7 +85,6 @@ static esp_err_t update_post_handler(httpd_req_t *req)
         remaining -= received;
 
         // Log progress every ~10%
-        static int last_percent = -1;
         int percent = (int)(((float)(req->content_len - remaining) / req->content_len) * 100);
         if (percent % 10 == 0 && percent != last_percent) {
             ESP_LOGI(TAG, "OTA Progress: %d%% (%d / %d bytes)", percent, (int)(req->content_len - remaining), (int)req->content_len);
@@ -96,12 +125,19 @@ esp_err_t ota_module_init(void)
 
     ESP_LOGI(TAG, "Starting OTA Web Server on port %d", config.server_port);
     if (httpd_start(&server, &config) == ESP_OK) {
+        httpd_uri_t index_uri = {
+            .uri       = "/",
+            .method    = HTTP_GET,
+            .handler   = index_get_handler,
+            .user_ctx  = NULL
+        };
         httpd_uri_t update_uri = {
             .uri       = "/update",
             .method    = HTTP_POST,
             .handler   = update_post_handler,
             .user_ctx  = NULL
         };
+        httpd_register_uri_handler(server, &index_uri);
         httpd_register_uri_handler(server, &update_uri);
         return ESP_OK;
     }
