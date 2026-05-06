@@ -48,6 +48,12 @@ cmake_install.cmake
 install_manifest.txt
 CTestTestfile.cmake
 
+# Debug and analysis scripts (local development only)
+debug_*.py
+*_debug.py
+debug_*.txt
+register_dump*.txt
+
 # Python environment files
 *.pyc
 *.pyo

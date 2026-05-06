@@ -4,7 +4,9 @@
 
 import argparse
 import re
+import select
 import socket
+import termios
 import threading
 import time
 import shutil
@@ -254,13 +256,70 @@ class RobotMonitor:
             self.redraw_event.clear()
             self._redraw_dashboard_line()
 
+    def _readline_simple(self, prompt):
+        """Raw-mode line reader: handles DEL/^H as backspace, drains escape seqs."""
+        if not sys.stdin.isatty():
+            return input(prompt)
+
+        with self.print_lock:
+            sys.stdout.write(prompt)
+            sys.stdout.flush()
+
+        fd = sys.stdin.fileno()
+        old = termios.tcgetattr(fd)
+        new = termios.tcgetattr(fd)
+        # Disable canonical mode, echo, signal chars — but leave OPOST alone
+        # so background print() calls still get the \n→\r\n translation.
+        new[3] &= ~(termios.ECHO | termios.ICANON | termios.IEXTEN | termios.ISIG)
+        new[6][termios.VMIN] = 1
+        new[6][termios.VTIME] = 0
+        termios.tcsetattr(fd, termios.TCSADRAIN, new)
+        buf = []
+        try:
+            while True:
+                ch = sys.stdin.read(1)
+                if ch in ('\r', '\n'):
+                    with self.print_lock:
+                        sys.stdout.write('\n')
+                        sys.stdout.flush()
+                    return ''.join(buf)
+                if ch == '\x03':
+                    raise KeyboardInterrupt
+                if ch == '\x04':
+                    raise EOFError
+                if ch in ('\x7f', '\x08'):
+                    if buf:
+                        buf.pop()
+                        with self.print_lock:
+                            sys.stdout.write('\x08 \x08')
+                            sys.stdout.flush()
+                elif ch == '\x1b':
+                    # Drain escape sequence (arrow keys, forward-delete, etc.)
+                    r, _, _ = select.select([sys.stdin], [], [], 0.05)
+                    if r:
+                        nxt = sys.stdin.read(1)
+                        if nxt == '[':
+                            while True:
+                                r2, _, _ = select.select([sys.stdin], [], [], 0.05)
+                                if not r2:
+                                    break
+                                c = sys.stdin.read(1)
+                                if c.isalpha() or c == '~':
+                                    break
+                elif ord(ch) >= 32:
+                    buf.append(ch)
+                    with self.print_lock:
+                        sys.stdout.write(ch)
+                        sys.stdout.flush()
+        finally:
+            termios.tcsetattr(fd, termios.TCSADRAIN, old)
+
     def interactive_shell(self):
         height = shutil.get_terminal_size(fallback=(120, 24)).lines
         prompt_row = self.DASHBOARD_LINES + 1
-        # Clear screen, then lock rows 1-DASHBOARD_LINES as a fixed header by
-        # setting the scroll region to prompt_row..height. Readline will only
-        # ever see rows in the scroll region, so our header writes can't corrupt
-        # its cursor tracking.
+        # Clear screen and lock rows 1-DASHBOARD_LINES as a fixed header.
+        # Scroll region confines all input/output to prompt_row..height so
+        # dashboard writes to rows 1-5 never corrupt the input area.
         sys.stdout.write(
             "\x1b[2J\x1b[H"                          # clear screen
             f"\x1b[{prompt_row};{height}r"            # set scroll region
@@ -272,7 +331,7 @@ class RobotMonitor:
         try:
             while self.running:
                 try:
-                    cmd = input(self.prompt).strip()
+                    cmd = self._readline_simple(self.prompt).strip()
                 except (KeyboardInterrupt, EOFError):
                     self.running = False
                     break
@@ -297,7 +356,8 @@ class RobotMonitor:
         print("[*] Exiting...")
 
     def print_help(self):
-        print(
+        with self.print_lock:
+            print(
             """
 Available commands:
   start                    Arm balance control

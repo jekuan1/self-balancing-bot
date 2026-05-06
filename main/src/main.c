@@ -376,6 +376,9 @@ void app_main(void)
         motor_module_set_enabled(&g_runtime.motor_hal, false);
     }
     ESP_LOGI(TAG, "[MOTOR TEST] Done");
+    // Freeze the AT#1 auto-tuning results so StealthChop2 never re-runs the
+    // noisy convergence phase on subsequent start commands.
+    motor_module_tmc2240_freeze_tuning();
 
     // Disable watchdog interrupts to reduce motor control jitter
     // (DIAG interrupts were causing audible artifacts in motor noise)

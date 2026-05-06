@@ -131,27 +131,24 @@ static uint8_t tmc2240_microsteps_to_mres(uint16_t microsteps)
     return 0x6;
 }
 
-static uint8_t tmc2240_current_ma_to_cs(uint16_t current_ma)
+static uint8_t tmc2240_current_ma_to_cs(uint16_t current_ma, uint8_t current_range)
 {
-    /**
-     * In Integrated Lossless Sensing mode, the CS (Current Scale) value 
-     * is a linear ratio of the peak current supported by the selected 
-     * CURRENT_RANGE in register 0x0A.
-     * * For TMC2240 with Integrated Sensing:
-     * Full Scale Current (at CS=31) is determined by CURRENT_RANGE bits.
-     * If CURRENT_RANGE = 0b00 (0), Full Scale is ~1.1A RMS.
-     * If CURRENT_RANGE = 0b01 (1), Full Scale is ~2.3A RMS.
-     * If CURRENT_RANGE = 0b10 (2), Full Scale is ~3.4A RMS.
-     * * Assuming CURRENT_RANGE 1 (2.3A / 2300mA RMS full scale):
-     */
-    const uint16_t max_rms_ma = 2300; 
-    
-    // Calculate CS: (current_ma / max_rms_ma) * 32 - 1
-    float cs_f = ((float)current_ma / (float)max_rms_ma) * 32.0f - 1.0f;
+    // Full-scale RMS current is set by CURRENT_RANGE bits in DRV_CONF (0x0A).
+    // CS must be scaled relative to the selected range's full scale or the
+    // delivered current will be wrong (e.g. using 2300mA denominator with
+    // range-0 hardware gives ~50% of the requested current).
+    uint16_t max_rms_ma;
+    if (current_range == 0) {
+        max_rms_ma = 1100;
+    } else if (current_range == 1) {
+        max_rms_ma = 2300;
+    } else {
+        max_rms_ma = 3400;
+    }
 
+    float cs_f = ((float)current_ma / (float)max_rms_ma) * 32.0f - 1.0f;
     if (cs_f < 0.0f) return 0;
     if (cs_f > 31.0f) return 31;
-    
     return (uint8_t)(cs_f + 0.5f);
 }
 
@@ -507,20 +504,21 @@ static void tmc2240_format_drv_status(uint32_t drv_status, char *buf, size_t buf
         return;
     }
 
-    const bool stst = (drv_status & (1UL << 31)) != 0;
-    const bool olb = (drv_status & (1UL << 30)) != 0;
-    const bool ola = (drv_status & (1UL << 29)) != 0;
-    const bool s2gb = (drv_status & (1UL << 28)) != 0;
-    const bool s2ga = (drv_status & (1UL << 27)) != 0;
-    const bool otpw = (drv_status & (1UL << 26)) != 0;
-    const bool ot = (drv_status & (1UL << 25)) != 0;
+    // DRV_STATUS (0x6F) bit assignments per TMC2240 datasheet.
+    const bool stst  = (drv_status & (1UL << 31)) != 0;  // standstill
+    const bool olb   = (drv_status & (1UL << 30)) != 0;  // open load B
+    const bool ola   = (drv_status & (1UL << 29)) != 0;  // open load A
+    const bool s2gb  = (drv_status & (1UL << 28)) != 0;  // short to GND B
+    const bool s2ga  = (drv_status & (1UL << 27)) != 0;  // short to GND A
+    const bool otpw  = (drv_status & (1UL << 26)) != 0;  // overtemp pre-warning
+    const bool ot    = (drv_status & (1UL << 25)) != 0;  // overtemperature
+    const bool s2vsb = (drv_status & (1UL << 24)) != 0;  // short to supply B
+    const bool s2vsa = (drv_status & (1UL << 23)) != 0;  // short to supply A
+    const uint16_t sg_result = tmc2240_extract_sg_result(drv_status); // bits 9:0
+    const uint8_t cs_actual  = (uint8_t)((drv_status >> 16) & 0x1FU); // bits 20:16
 
-    // Extract additional useful fields: SG_RESULT (bits 9:0) and CS_ACTUAL (bits 20:16)
-    const uint16_t sg_result = tmc2240_extract_sg_result(drv_status);
-    const uint8_t cs_actual = (uint8_t)((drv_status >> 16) & 0x1FU);
-
-
-    if (!stst && !olb && !ola && !s2gb && !s2ga && !otpw && !ot && sg_result == 0 && cs_actual == 0) {
+    const bool any_fault = stst || olb || ola || s2gb || s2ga || otpw || ot || s2vsb || s2vsa;
+    if (!any_fault && sg_result == 0 && cs_actual == 0) {
         snprintf(buf, buf_size, "no_fault_bits");
         return;
     }
@@ -528,38 +526,17 @@ static void tmc2240_format_drv_status(uint32_t drv_status, char *buf, size_t buf
     buf[0] = '\0';
     bool first = true;
 
-    if (stst) {
-        snprintf(buf + strlen(buf), buf_size - strlen(buf), "%sSTST", first ? "" : ",");
-        first = false;
-    }
-    if (olb) {
-        snprintf(buf + strlen(buf), buf_size - strlen(buf), "%sOLB", first ? "" : ",");
-        first = false;
-    }
-    if (ola) {
-        snprintf(buf + strlen(buf), buf_size - strlen(buf), "%sOLA", first ? "" : ",");
-        first = false;
-    }
-    if (s2gb) {
-        snprintf(buf + strlen(buf), buf_size - strlen(buf), "%sS2GB", first ? "" : ",");
-        first = false;
-    }
-    if (s2ga) {
-        snprintf(buf + strlen(buf), buf_size - strlen(buf), "%sS2GA", first ? "" : ",");
-        first = false;
-    }
-    if (otpw) {
-        snprintf(buf + strlen(buf), buf_size - strlen(buf), "%sOTPW", first ? "" : ",");
-        first = false;
-    }
-    if (ot) {
-        snprintf(buf + strlen(buf), buf_size - strlen(buf), "%sOT", first ? "" : ",");
-    }
+    if (stst)  { snprintf(buf + strlen(buf), buf_size - strlen(buf), "%sSTST",  first ? "" : ","); first = false; }
+    if (olb)   { snprintf(buf + strlen(buf), buf_size - strlen(buf), "%sOLB",   first ? "" : ","); first = false; }
+    if (ola)   { snprintf(buf + strlen(buf), buf_size - strlen(buf), "%sOLA",   first ? "" : ","); first = false; }
+    if (s2gb)  { snprintf(buf + strlen(buf), buf_size - strlen(buf), "%sS2GB",  first ? "" : ","); first = false; }
+    if (s2ga)  { snprintf(buf + strlen(buf), buf_size - strlen(buf), "%sS2GA",  first ? "" : ","); first = false; }
+    if (otpw)  { snprintf(buf + strlen(buf), buf_size - strlen(buf), "%sOTPW",  first ? "" : ","); first = false; }
+    if (ot)    { snprintf(buf + strlen(buf), buf_size - strlen(buf), "%sOT",    first ? "" : ","); first = false; }
+    if (s2vsb) { snprintf(buf + strlen(buf), buf_size - strlen(buf), "%sS2VSB", first ? "" : ","); first = false; }
+    if (s2vsa) { snprintf(buf + strlen(buf), buf_size - strlen(buf), "%sS2VSA", first ? "" : ","); first = false; }
 
-    // Append StallGuard and current-actual fields for better diagnostics.
-    // SG_RESULT is only meaningful when the driver is in the StallGuard-active
-    // operating region, which this module configures with TPWMTHRS/TCOOLTHRS.
-    snprintf(buf + strlen(buf), buf_size - strlen(buf), "%sSG=%u", first ? "" : ",", (unsigned)sg_result);
+    snprintf(buf + strlen(buf), buf_size - strlen(buf), "%sSG=%u",    first ? "" : ",", (unsigned)sg_result);
     snprintf(buf + strlen(buf), buf_size - strlen(buf), ",CS_ACT=%u", (unsigned)cs_actual);
 }
 
@@ -620,6 +597,16 @@ static esp_err_t tmc2240_read_temp_c_ctx(tmc2240_spi_ctx_t *ctx, float *out_temp
     if (err != ESP_OK) return err;
     // ADC_TEMP is in bits 12:0 (13 bits). Extract raw ADC value first.
     uint16_t adc_raw = (uint16_t)(temp_raw & 0x1FFFU);
+
+    // DEBUG: Log raw register value once per context
+    static bool logged_left = false, logged_right = false;
+    bool *logged = (ctx == &s_tmc2240_left_ctx) ? &logged_left : &logged_right;
+    if (!*logged) {
+        ESP_LOGI(TAG, "%s ADC_TEMP raw register: 0x%08lX | adc_raw: %u (0x%04X) | formula gives: %.1f°C",
+                 ctx->label, (unsigned long)temp_raw, adc_raw, adc_raw,
+                 ((float)adc_raw - 2038.0f) / 7.7f);
+        *logged = true;
+    }
 
     // TMC2240 ADC_TEMP linearized conversion (typical):
     // T(C) = (ADC_RAW - 2038) / 7.7
@@ -883,9 +870,9 @@ void motor_module_tmc2240_configure_robot_mode(const TMC2240_RobotConfig_t *conf
     }
 
     const uint8_t mres = tmc2240_microsteps_to_mres(cfg.microsteps);
-    const uint8_t irun_cs = tmc2240_current_ma_to_cs(cfg.run_current_ma);
-    const uint8_t ihold_cs = tmc2240_current_ma_to_cs(cfg.hold_current_ma);
     const uint8_t current_range = tmc2240_select_current_range(cfg.run_current_ma);
+    const uint8_t irun_cs = tmc2240_current_ma_to_cs(cfg.run_current_ma, current_range);
+    const uint8_t ihold_cs = tmc2240_current_ma_to_cs(cfg.hold_current_ma, current_range);
 
     (void)cfg.cool_step_enabled;
 
@@ -986,13 +973,12 @@ void motor_module_tmc2240_configure_robot_mode(const TMC2240_RobotConfig_t *conf
             (void)tmc2240_write_reg_ctx(ctx, 0x13, cfg.stealth_threshold);
         }
 
-        // TCOOLTHRS (0x14): StallGuard4 + CoolStep active for TSTEP <= this value.
-        // Set equal to TPWMTHRS so StallGuard becomes active as soon as the driver
-        // transitions out of StealthChop and into SpreadCycle.
-        // Without this, SG_RESULT can appear stuck at a default or saturated value.
-        if (cfg.stealth_threshold > 0) {
-            (void)tmc2240_write_reg_ctx(ctx, 0x14, cfg.stealth_threshold);
-        }
+        // TCOOLTHRS (0x14): StallGuard4 active when TSTEP <= this value.
+        // TSTEP is the measured step period in internal clock cycles; at 500 Hz
+        // steps TSTEP ≈ 24 000 — far above stealth_threshold=500. Setting
+        // TCOOLTHRS = TPWMTHRS meant StallGuard was never active at robot speeds,
+        // producing SG_RESULT=0 always. Set to 20-bit max so SG4 is always enabled.
+        (void)tmc2240_write_reg_ctx(ctx, 0x14, 0xFFFFFUL);
 
         // Enable StealthChop2 auto-tuning and keep freewheel disabled so the
         // driver maintains holding torque using IHOLD at standstill.
@@ -1040,8 +1026,16 @@ void motor_module_tmc2240_configure_robot_mode(const TMC2240_RobotConfig_t *conf
         uint8_t tx_curr[5] = { (uint8_t)(0x10 | 0x80), (uint8_t)(ihold_irun>>24), (uint8_t)(ihold_irun>>16), (uint8_t)(ihold_irun>>8), (uint8_t)ihold_irun };
         tmc2240_transfer_40b_ctx(ctx, tx_curr, rx_data);
 
+        uint32_t chopconf_readback = 0;
+        if (tmc2240_read_reg_u32_ctx(ctx, 0x6C, &chopconf_readback) == ESP_OK) {
+            ESP_LOGI(TAG,
+                     "%s CHOPCONF readback: 0x%08lX (expected ~0x14410155 range) | SPI communication check",
+                     ctx->label,
+                     (unsigned long)chopconf_readback);
+        }
+
         ESP_LOGI(TAG,
-                 "%s TMC2240 config: microsteps=%u IRUN_CS=%u IHOLD_CS=%u RANGE=%u INTPOL=%d TPWMTHRS=%lu TCOOLTHRS=%lu SG4_THRS=%u SG4_FILT=1",
+                 "%s TMC2240 config: microsteps=%u IRUN_CS=%u IHOLD_CS=%u RANGE=%u INTPOL=%d TPWMTHRS=%lu TCOOLTHRS=0xFFFFF SG4_THRS=%u SG4_FILT=1",
                  ctx->label,
                  (unsigned)cfg.microsteps,
                  (unsigned)irun_cs,
@@ -1049,8 +1043,44 @@ void motor_module_tmc2240_configure_robot_mode(const TMC2240_RobotConfig_t *conf
                  (unsigned)current_range,
                  cfg.interpolate ? 1 : 0,
                  (unsigned long)cfg.stealth_threshold,
-                 (unsigned long)cfg.stealth_threshold,
                  (unsigned)cfg.stall_sensitivity);
+    }
+}
+
+void motor_module_tmc2240_freeze_tuning(void)
+{
+    // After the boot motor test, AT#1 has fully converged and PWM_AUTO (0x72)
+    // holds the learned OFS_AUTO and GRAD_AUTO values.  Write those back into
+    // PWMCONF as fixed OFS/GRAD and clear AUTOGRAD (bit 19) so AT#1 never
+    // re-runs on subsequent start commands.  AUTOSCALE (bit 18) stays enabled
+    // so amplitude still adapts to changing load.
+    tmc2240_spi_ctx_t *ctxs[2] = {&s_tmc2240_left_ctx, &s_tmc2240_right_ctx};
+    for (int i = 0; i < 2; i++) {
+        tmc2240_spi_ctx_t *ctx = ctxs[i];
+        if (!ctx->initialized) continue;
+
+        uint32_t pwm_auto = 0;
+        if (tmc2240_read_reg_u32_ctx(ctx, 0x72, &pwm_auto) != ESP_OK) {
+            ESP_LOGW(TAG, "%s: failed to read PWM_AUTO; AUTOGRAD left enabled", ctx->label);
+            continue;
+        }
+        const uint8_t ofs_auto  = (uint8_t)(pwm_auto & 0xFFU);
+        const uint8_t grad_auto = (uint8_t)((pwm_auto >> 16) & 0xFFU);
+
+        uint32_t pwmconf = 0;
+        if (tmc2240_read_reg_u32_ctx(ctx, 0x70, &pwmconf) != ESP_OK) {
+            ESP_LOGW(TAG, "%s: failed to read PWMCONF; AUTOGRAD left enabled", ctx->label);
+            continue;
+        }
+
+        // Replace initial OFS/GRAD with AT#1-learned values and clear AUTOGRAD.
+        pwmconf = (pwmconf & ~(0xFFUL | (0xFFUL << 8) | (1UL << 19)))
+                | (uint32_t)ofs_auto
+                | ((uint32_t)grad_auto << 8);
+        (void)tmc2240_write_reg_ctx(ctx, 0x70, pwmconf);
+
+        ESP_LOGI(TAG, "%s: AT#1 tuning frozen — OFS=%u GRAD=%u AUTOGRAD disabled",
+                 ctx->label, ofs_auto, grad_auto);
     }
 }
 
