@@ -8,6 +8,8 @@
 #include "esp_err.h"
 #include "esp_log.h"
 #include "esp_timer.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 
 static const char *TAG = "motor_module";
 
@@ -40,6 +42,7 @@ static tmc2240_spi_ctx_t s_tmc2240_right_ctx = {
 
 static bool s_tmc2240_bus_initialized = false;
 static int s_tmc2240_bus_host = -1;
+static SemaphoreHandle_t s_spi_read_mutex = NULL;
 static motor_module_t *s_active_motor = NULL;
 static esp_timer_handle_t s_motor_timer_handle = NULL;
 
@@ -103,7 +106,13 @@ static esp_err_t tmc2240_transfer_40b_ctx(tmc2240_spi_ctx_t *ctx, uint8_t tx[5],
         .tx_buffer = tx,
         .rx_buffer = rx,
     };
-    return spi_device_transmit(ctx->spi_dev, &t);
+    esp_err_t err = spi_device_polling_transmit(ctx->spi_dev, &t);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "%s spi_device_polling_transmit failed: %s (tx=%02X%02X%02X%02X%02X)",
+                 ctx->label, esp_err_to_name(err),
+                 tx[0], tx[1], tx[2], tx[3], tx[4]);
+    }
+    return err;
 }
 
 // Forward declarations for functions defined later but used earlier.
@@ -295,28 +304,44 @@ static esp_err_t tmc2240_read_reg_raw_ctx(tmc2240_spi_ctx_t *ctx,
     tx_cmd[3] = 0;
     tx_cmd[4] = 0;
 
+    // Lock a mutex to make the two-frame read atomic across tasks. Without this,
+    // another task can insert a write between the address frame and the NOP frame,
+    // corrupting the TMC2240's internal read pointer and returning wrong data.
+    // We use a FreeRTOS mutex instead of spi_device_acquire_bus because
+    // acquire_bus is incompatible with spi_device_transmit/polling_transmit.
+    if (s_spi_read_mutex != NULL) {
+        xSemaphoreTake(s_spi_read_mutex, portMAX_DELAY);
+    }
+
     // First transfer: send the read command. The TMC2240 uses a delayed-read
     // SPI protocol: the response to the read command is returned in the
     // *following* frame. The first transfer returns the status byte and the
     // result of the previous read; capture it in rx_cmd for debugging.
     esp_err_t err = tmc2240_transfer_40b_ctx(ctx, tx_cmd, rx_cmd);
     if (err != ESP_OK) {
+        if (s_spi_read_mutex != NULL) xSemaphoreGive(s_spi_read_mutex);
         ESP_LOGW(TAG, "%s SPI read cmd transfer failed: %s", ctx->label, esp_err_to_name(err));
         return err;
     }
 
     // CSN high-time delay to meet TMC2240 inter-transfer timing requirement.
-    // The SPI driver's cs_ena_posttrans handles most of this, but we add extra
-    // delay to ensure robust operation.
     esp_rom_delay_us(10);
 
     // Second transfer: send a NOP to clock out the data for the requested
     // register. rx_data[1..4] will contain the requested 32-bit register.
     uint8_t tx_nop[5] = {0, 0, 0, 0, 0};
     esp_err_t err2 = tmc2240_transfer_40b_ctx(ctx, tx_nop, rx_data);
+    if (s_spi_read_mutex != NULL) xSemaphoreGive(s_spi_read_mutex);
     if (err2 != ESP_OK) {
         ESP_LOGW(TAG, "%s SPI read data transfer failed: %s", ctx->label, esp_err_to_name(err2));
         return err2;
+    }
+
+    if (reg_addr == 0x51) {
+        ESP_LOGI(TAG, "%s reg=0x51 frame1=[%02X %02X %02X %02X %02X] frame2=[%02X %02X %02X %02X %02X]",
+                 ctx->label,
+                 rx_cmd[0], rx_cmd[1], rx_cmd[2], rx_cmd[3], rx_cmd[4],
+                 rx_data[0], rx_data[1], rx_data[2], rx_data[3], rx_data[4]);
     }
 
     // rx_cmd[0] = status from first frame, rx_cmd[1..4] = stale data
@@ -342,6 +367,10 @@ static esp_err_t tmc2240_spi_init_ctx(tmc2240_spi_ctx_t *ctx,
 
     if (spi_clock_hz <= 0) {
         spi_clock_hz = 1000000;
+    }
+
+    if (s_spi_read_mutex == NULL) {
+        s_spi_read_mutex = xSemaphoreCreateMutex();
     }
 
     if (!s_tmc2240_bus_initialized) {
@@ -599,14 +628,9 @@ static esp_err_t tmc2240_read_temp_c_ctx(tmc2240_spi_ctx_t *ctx, float *out_temp
     uint16_t adc_raw = (uint16_t)(temp_raw & 0x1FFFU);
 
     // DEBUG: Log raw register value once per context
-    static bool logged_left = false, logged_right = false;
-    bool *logged = (ctx == &s_tmc2240_left_ctx) ? &logged_left : &logged_right;
-    if (!*logged) {
-        ESP_LOGI(TAG, "%s ADC_TEMP raw register: 0x%08lX | adc_raw: %u (0x%04X) | formula gives: %.1f°C",
-                 ctx->label, (unsigned long)temp_raw, adc_raw, adc_raw,
-                 ((float)adc_raw - 2038.0f) / 7.7f);
-        *logged = true;
-    }
+    ESP_LOGI(TAG, "%s ADC_TEMP raw register: 0x%08lX | adc_raw: %u (0x%04X) | formula gives: %.1f°C",
+             ctx->label, (unsigned long)temp_raw, adc_raw, adc_raw,
+             ((float)adc_raw - 2038.0f) / 7.7f);
 
     // TMC2240 ADC_TEMP linearized conversion (typical):
     // T(C) = (ADC_RAW - 2038) / 7.7
@@ -690,6 +714,10 @@ void motor_module_init(motor_module_t *motor)
     }
 }
 
+// NOTE: left and right share a single EN pin (GPIO 18), so enable=true just
+// confirms the pin is driven active; there is no per-motor hardware gate.
+// enable=false is purely a software pulse-stop — the TMC2240s remain powered
+// and holding current at all times after motor_module_init().
 void motor_module_set_enabled(motor_module_t *motor, bool enable)
 {
     motor->left.enabled = enable;
@@ -810,38 +838,53 @@ void motor_module_tmc2240_test_log(void)
     const uint16_t left_pwm_scale_sum = (uint16_t)(left_pwm_status & 0x03FFU);
     const uint16_t right_pwm_scale_sum = (uint16_t)(right_pwm_status & 0x03FFU);
     // SG_RESULT bits 9:0 — lower = higher load, ~0 = near stall
-    const uint16_t left_sg = tmc2240_extract_sg_result(left_drv_status);
+    const uint16_t left_sg  = tmc2240_extract_sg_result(left_drv_status);
     const uint16_t right_sg = tmc2240_extract_sg_result(right_drv_status);
+    // STST bit (31) is set when motor is at standstill. SG_RESULT is
+    // meaningless then — show "stst" instead of a misleading number.
+    const bool left_stst  = (left_drv_status  & (1UL << 31)) != 0;
+    const bool right_stst = (right_drv_status & (1UL << 31)) != 0;
+    const uint8_t left_cs_actual  = (uint8_t)((left_drv_status  >> 16) & 0x1FU);
+    const uint8_t right_cs_actual = (uint8_t)((right_drv_status >> 16) & 0x1FU);
+    char left_sg_str[8], right_sg_str[8];
+    if (left_stst)  { snprintf(left_sg_str,  sizeof(left_sg_str),  "stst"); }
+    else            { snprintf(left_sg_str,  sizeof(left_sg_str),  "%u", (unsigned)left_sg); }
+    if (right_stst) { snprintf(right_sg_str, sizeof(right_sg_str), "stst"); }
+    else            { snprintf(right_sg_str, sizeof(right_sg_str), "%u", (unsigned)right_sg); }
 
     if (left_ok && right_ok) {
         ESP_LOGI(TAG,
-                 "TMC — LEFT: %.2f C, %.0f mA, PWM_SUM=%u, AUTO=%u, SG=%u | RIGHT: %.2f C, %.0f mA, PWM_SUM=%u, AUTO=%u, SG=%u",
+                 "TMC — LEFT: %.2f C, %.0f mA, CS=%u, PWM_SUM=%u, AUTO=%u, SG=%s | RIGHT: %.2f C, %.0f mA, CS=%u, PWM_SUM=%u, AUTO=%u, SG=%s",
                  (double)left_temp,
                  (double)left_current_ma,
+                 (unsigned)left_cs_actual,
                  (unsigned)left_pwm_scale_sum,
                  (unsigned)left_pwm_auto,
-                 (unsigned)left_sg,
+                 left_sg_str,
                  (double)right_temp,
                  (double)right_current_ma,
+                 (unsigned)right_cs_actual,
                  (unsigned)right_pwm_scale_sum,
                  (unsigned)right_pwm_auto,
-                 (unsigned)right_sg);
+                 right_sg_str);
     } else if (left_ok) {
         ESP_LOGI(TAG,
-                 "TMC — LEFT: %.2f C, %.0f mA, PWM_SUM=%u, AUTO=%u, SG=%u | RIGHT: ERR",
+                 "TMC — LEFT: %.2f C, %.0f mA, CS=%u, PWM_SUM=%u, AUTO=%u, SG=%s | RIGHT: ERR",
                  (double)left_temp,
                  (double)left_current_ma,
+                 (unsigned)left_cs_actual,
                  (unsigned)left_pwm_scale_sum,
                  (unsigned)left_pwm_auto,
-                 (unsigned)left_sg);
+                 left_sg_str);
     } else if (right_ok) {
         ESP_LOGI(TAG,
-                 "TMC — LEFT: ERR | RIGHT: %.2f C, %.0f mA, PWM_SUM=%u, AUTO=%u, SG=%u",
+                 "TMC — LEFT: ERR | RIGHT: %.2f C, %.0f mA, CS=%u, PWM_SUM=%u, AUTO=%u, SG=%s",
                  (double)right_temp,
                  (double)right_current_ma,
+                 (unsigned)right_cs_actual,
                  (unsigned)right_pwm_scale_sum,
                  (unsigned)right_pwm_auto,
-                 (unsigned)right_sg);
+                 right_sg_str);
     } else {
         ESP_LOGW(TAG,
                  "TMC — LEFT: ERR(%s/%s/%s) | RIGHT: ERR(%s/%s/%s)",
@@ -851,6 +894,43 @@ void motor_module_tmc2240_test_log(void)
                  esp_err_to_name(rerr),
                  esp_err_to_name(rcurr_err),
                  esp_err_to_name(rpwm_err));
+    }
+}
+
+void motor_module_tmc2240_log_config(void)
+{
+    tmc2240_spi_ctx_t *ctxs[2] = {&s_tmc2240_left_ctx, &s_tmc2240_right_ctx};
+    for (int i = 0; i < 2; i++) {
+        tmc2240_spi_ctx_t *ctx = ctxs[i];
+        if (!ctx->initialized) {
+            ESP_LOGI(TAG, "%s TMC2240: not initialized", ctx->label);
+            continue;
+        }
+        uint32_t drv_conf = 0, ihold_irun = 0, chopconf = 0;
+        (void)tmc2240_read_reg_u32_ctx(ctx, 0x0A, &drv_conf);
+        (void)tmc2240_read_reg_u32_ctx(ctx, 0x10, &ihold_irun);
+        (void)tmc2240_read_reg_u32_ctx(ctx, 0x6C, &chopconf);
+        const uint8_t current_range = (uint8_t)(drv_conf & 0x03U);
+        const uint8_t adcinsel      = (uint8_t)((drv_conf >> 2) & 0x03U);
+        const uint8_t ihold         = (uint8_t)(ihold_irun & 0x1FU);
+        const uint8_t irun          = (uint8_t)((ihold_irun >> 8) & 0x1FU);
+        const uint8_t mres          = (uint8_t)((chopconf >> 24) & 0x0FU);
+        const bool    intpol        = (chopconf & (1UL << 28)) != 0;
+        static const uint16_t mres_table[16] = {256,128,64,32,16,8,4,2,1,1,1,1,1,1,1,1};
+        uint16_t usteps = mres_table[mres & 0x0F];
+        static const uint16_t range_ma[3] = {1100, 2300, 3400};
+        uint16_t full_scale = range_ma[current_range < 3 ? current_range : 2];
+        uint16_t irun_ma  = (uint16_t)(((uint32_t)(irun  + 1) * full_scale) / 32);
+        uint16_t ihold_ma = (uint16_t)(((uint32_t)(ihold + 1) * full_scale) / 32);
+        ESP_LOGI(TAG,
+                 "%s CONFIG: CURRENT_RANGE=%u(%umA fs) IRUN=%u(~%umA) IHOLD=%u(~%umA) MRES=%u(%u ustep) INTPOL=%d ADCINSEL=%u",
+                 ctx->label,
+                 current_range, full_scale,
+                 irun, irun_ma,
+                 ihold, ihold_ma,
+                 mres, usteps,
+                 intpol ? 1 : 0,
+                 adcinsel);
     }
 }
 
@@ -895,8 +975,6 @@ void motor_module_tmc2240_configure_robot_mode(const TMC2240_RobotConfig_t *conf
                      esp_err_to_name(derr));
         }
 
-        uint8_t rx_data[5] = {0};
-
         char gstat_text[48];
         char drv_text[96];
         tmc2240_format_gstat(gstat, gstat_text, sizeof(gstat_text));
@@ -921,8 +999,7 @@ void motor_module_tmc2240_configure_robot_mode(const TMC2240_RobotConfig_t *conf
         // Clear sticky GSTAT error flags (write 1 to clear). Use 0x1F to clear all
         // sticky flags: Reset, DrvErr, UV_CP, RegReset, VM_UVLO (bits 0-4).
         // This must happen AFTER the status check to avoid missing the reset_flag.
-        uint8_t tx_gstat_clear[5] = { (uint8_t)(0x01 | 0x80), 0, 0, 0, 0x1F };
-        tmc2240_transfer_40b_ctx(ctx, tx_gstat_clear, rx_data);
+        (void)tmc2240_write_reg_ctx(ctx, 0x01, 0x1F);
 
         // Explicitly enable stealthChop in GCONF (en_pwm_mode = bit 0).
         // Do a read-modify-write so we don't inadvertently clear other GCONF bits.
@@ -935,28 +1012,39 @@ void motor_module_tmc2240_configure_robot_mode(const TMC2240_RobotConfig_t *conf
             (void)tmc2240_write_reg_ctx(ctx, 0x00, 0x00000001);
         }
 
-        // Configure DRV_CONF using only CURRENT_RANGE in bits 1:0.
-        // This keeps the driver's current scaling aligned with the configured run current.
-        const uint32_t drv_conf_value = ((uint32_t)(current_range & 0x03U));
+        // DRV_CONF (0x0A):
+        //   bits 1:0 = CURRENT_RANGE (sets full-scale RMS current)
+        //   bits 3:2 = ADCINSEL: 00=AIN/supply, 01=temperature sensor
+        // Write CURRENT_RANGE first alone, then set ADCINSEL separately with a
+        // delay between them. Some TMC2240 silicon ignores ADCINSEL when written
+        // in the same frame as CURRENT_RANGE due to internal sequencing.
+        const uint32_t drv_conf_range_only = (uint32_t)(current_range & 0x03U);
+        (void)tmc2240_write_reg_ctx(ctx, 0x0A, drv_conf_range_only);
+        esp_rom_delay_us(100);
+        const uint32_t drv_conf_value = drv_conf_range_only | (1UL << 2);
         (void)tmc2240_write_reg_ctx(ctx, 0x0A, drv_conf_value);
 
-        // Read back the register immediately to prove the chip accepted the setting.
-        esp_rom_delay_us(50);
+        // Read back to verify. Retry once if ADCINSEL didn't land.
+        esp_rom_delay_us(100);
         uint32_t drv_conf_read = 0;
         esp_err_t drv_conf_err = tmc2240_read_reg_u32_ctx(ctx, 0x0A, &drv_conf_read);
-        const uint32_t drv_conf_read_current_range = drv_conf_read & 0x03U;
-        if (drv_conf_err != ESP_OK || drv_conf_read_current_range != (current_range & 0x03U)) {
+        if (drv_conf_err == ESP_OK && (drv_conf_read & 0x0FU) != (drv_conf_value & 0x0FU)) {
+            esp_rom_delay_us(500);
+            (void)tmc2240_write_reg_ctx(ctx, 0x0A, drv_conf_value);
+            esp_rom_delay_us(200);
+            (void)tmc2240_read_reg_u32_ctx(ctx, 0x0A, &drv_conf_read);
+        }
+        const uint32_t drv_conf_read_lower4 = drv_conf_read & 0x0FU;
+        if (drv_conf_err != ESP_OK || drv_conf_read_lower4 != (drv_conf_value & 0x0FU)) {
             ESP_LOGE(TAG,
-                     "%s CONFIG FAILED: Wrote CURRENT_RANGE=%u (DRV_CONF=0x%08lX), Read DRV_CONF=0x%08lX (CURRENT_RANGE=%u, %s)",
+                     "%s CONFIG FAILED: Wrote DRV_CONF=0x%08lX, Read DRV_CONF=0x%08lX (%s)",
                      ctx->label,
-                     (unsigned)current_range,
                      (unsigned long)drv_conf_value,
                      (unsigned long)drv_conf_read,
-                     (unsigned)drv_conf_read_current_range,
                      esp_err_to_name(drv_conf_err));
         } else {
             ESP_LOGI(TAG,
-                     "%s CONFIG SUCCESS: CURRENT_RANGE=%u (DRV_CONF=0x%08lX)",
+                     "%s CONFIG SUCCESS: CURRENT_RANGE=%u ADCINSEL=temp (DRV_CONF=0x%08lX)",
                      ctx->label,
                      (unsigned)current_range,
                      (unsigned long)drv_conf_read);
@@ -1016,22 +1104,29 @@ void motor_module_tmc2240_configure_robot_mode(const TMC2240_RobotConfig_t *conf
         if (cfg.interpolate) {
             chopconf |= (1UL << 28); // INTPOL
         }
-        uint8_t tx_chop[5] = { (uint8_t)(0x6C | 0x80), (uint8_t)(chopconf>>24), (uint8_t)(chopconf>>16), (uint8_t)(chopconf>>8), (uint8_t)chopconf };
-        tmc2240_transfer_40b_ctx(ctx, tx_chop, rx_data);
+        (void)tmc2240_write_reg_ctx(ctx, 0x6C, chopconf);
 
-        // (TMC2240 defaults GCONF and PWMCONF perfectly for StealthChop auto-tuning)
-        
         // Register format: bits 19:16=IHOLDDELAY, bits 12:8=IRUN, bits 4:0=IHOLD
         uint32_t ihold_irun = (6UL << 16) | (((uint32_t)irun_cs & 0x1F) << 8) | ((uint32_t)ihold_cs & 0x1F);
-        uint8_t tx_curr[5] = { (uint8_t)(0x10 | 0x80), (uint8_t)(ihold_irun>>24), (uint8_t)(ihold_irun>>16), (uint8_t)(ihold_irun>>8), (uint8_t)ihold_irun };
-        tmc2240_transfer_40b_ctx(ctx, tx_curr, rx_data);
+        (void)tmc2240_write_reg_ctx(ctx, 0x10, ihold_irun);
 
-        uint32_t chopconf_readback = 0;
-        if (tmc2240_read_reg_u32_ctx(ctx, 0x6C, &chopconf_readback) == ESP_OK) {
+        // Register readback: verify SPI reads return plausible data.
+        // CHOPCONF was just written, so it is a known-value check.
+        // ADC_TEMP (0x51) bits 12:0 should be ~2231 at 25°C.
+        // DRV_STATUS (0x6F) bits 9:0 = SG_RESULT, bits 20:16 = CS_ACTUAL.
+        {
+            uint32_t chopconf_rb = 0, ihold_rb = 0, adc_temp_rb = 0, drv_status_rb = 0;
+            (void)tmc2240_read_reg_u32_ctx(ctx, 0x6C, &chopconf_rb);
+            (void)tmc2240_read_reg_u32_ctx(ctx, 0x10, &ihold_rb);
+            (void)tmc2240_read_reg_u32_ctx(ctx, 0x51, &adc_temp_rb);
+            (void)tmc2240_read_reg_u32_ctx(ctx, 0x6F, &drv_status_rb);
             ESP_LOGI(TAG,
-                     "%s CHOPCONF readback: 0x%08lX (expected ~0x14410155 range) | SPI communication check",
+                     "%s RAW READBACK: CHOPCONF=0x%08lX IHOLD_IRUN=0x%08lX ADC_TEMP=0x%08lX DRV_STATUS=0x%08lX",
                      ctx->label,
-                     (unsigned long)chopconf_readback);
+                     (unsigned long)chopconf_rb,
+                     (unsigned long)ihold_rb,
+                     (unsigned long)adc_temp_rb,
+                     (unsigned long)drv_status_rb);
         }
 
         ESP_LOGI(TAG,

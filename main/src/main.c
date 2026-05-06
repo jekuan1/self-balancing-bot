@@ -43,6 +43,7 @@ typedef struct {
 } robot_runtime_t;
 
 static robot_runtime_t g_runtime = {0};
+static volatile motor_test_params_t g_motor_test_params = {0};
 
 bool robot_control_send_command(robot_control_command_t command)
 {
@@ -60,6 +61,15 @@ bool robot_control_send_stop(void)
 bool robot_control_send_start(void)
 {
     return robot_control_send_command(ROBOT_CONTROL_CMD_START);
+}
+
+bool robot_control_send_motor_test(const motor_test_params_t *params)
+{
+    if (params == NULL) return false;
+    g_motor_test_params.left_hz      = params->left_hz;
+    g_motor_test_params.right_hz     = params->right_hz;
+    g_motor_test_params.duration_ms  = params->duration_ms;
+    return robot_control_send_command(ROBOT_CONTROL_CMD_MOTOR_TEST);
 }
 
 bool robot_control_tune_pid(float kp, float ki, float kd)
@@ -124,7 +134,6 @@ static void maybe_start_ota_services(void)
 #define TMC_EN              GPIO_NUM_18
 
 // ============== LEFT MOTOR PINS ==============
-
 #define TMC_LEFT_STEP       GPIO_NUM_8
 #define TMC_LEFT_DIR        GPIO_NUM_13
 #define TMC_LEFT_SPI_CS     GPIO_NUM_21
@@ -177,6 +186,14 @@ static void control_task_fn(void *arg)
     const float PITCH_POLARITY = -1.0f;
     bool stopped = true;
 
+    // Outer velocity loop: integrates lin_accel_x to estimate forward velocity,
+    // then nudges target_pitch to cancel drift. K_VEL_P converts m/s to degrees
+    // of pitch offset. VEL_DECAY bleeds the integrator to prevent bias accumulation.
+    const float K_VEL_P  = 1.5f;   // deg per (m/s) — tune this
+    const float VEL_DECAY = 0.98f;  // per sample (~50Hz → τ ≈ 1s)
+    float velocity_ms = 0.0f;
+    int64_t last_sample_us = 0;
+
     while (1) {
         robot_control_command_t command = ROBOT_CONTROL_CMD_NONE;
         if (runtime->control_cmd_queue != NULL && xQueueReceive(runtime->control_cmd_queue, &command, 0) == pdTRUE) {
@@ -186,13 +203,34 @@ static void control_task_fn(void *arg)
                 motor_module_apply_command(&runtime->motor_hal, &runtime->test_cmd);
                 motor_module_set_enabled(&runtime->motor_hal, false);
                 pid_controller_reset(&runtime->balance_pid);
+                velocity_ms = 0.0f;
+                last_sample_us = 0;
                 stopped = true;
                 ESP_LOGW(TAG, "STOP command received: motors disabled");
             } else if (command == ROBOT_CONTROL_CMD_START) {
                 motor_module_set_enabled(&runtime->motor_hal, true);
                 pid_controller_reset(&runtime->balance_pid);
+                velocity_ms = 0.0f;
+                last_sample_us = 0;
                 stopped = false;
                 ESP_LOGI(TAG, "START command received: motors enabled");
+            } else if (command == ROBOT_CONTROL_CMD_MOTOR_TEST) {
+                motor_test_params_t p;
+                p.left_hz     = g_motor_test_params.left_hz;
+                p.right_hz    = g_motor_test_params.right_hz;
+                p.duration_ms = g_motor_test_params.duration_ms;
+                ESP_LOGI(TAG, "MOTOR_TEST: left=%.0f Hz right=%.0f Hz duration=%lu ms",
+                         (double)p.left_hz, (double)p.right_hz, (unsigned long)p.duration_ms);
+                motor_module_set_enabled(&runtime->motor_hal, true);
+                runtime->test_cmd.left_step_hz  = p.left_hz;
+                runtime->test_cmd.right_step_hz = p.right_hz;
+                motor_module_apply_command(&runtime->motor_hal, &runtime->test_cmd);
+                vTaskDelay(pdMS_TO_TICKS(p.duration_ms));
+                runtime->test_cmd.left_step_hz  = 0.0f;
+                runtime->test_cmd.right_step_hz = 0.0f;
+                motor_module_apply_command(&runtime->motor_hal, &runtime->test_cmd);
+                motor_module_set_enabled(&runtime->motor_hal, false);
+                ESP_LOGI(TAG, "MOTOR_TEST done");
             }
         }
 
@@ -204,23 +242,35 @@ static void control_task_fn(void *arg)
         imu_sample_t sample;
         // Block indefinitely until new IMU data arrives from the IMU task
         if (xQueueReceive(runtime->imu_queue, &sample, portMAX_DELAY) == pdTRUE) {
-            // 1. Get current pitch
+            // 1. Integrate linear acceleration to estimate velocity
+            if (last_sample_us != 0) {
+                float dt = (float)(sample.timestamp_us - last_sample_us) * 1e-6f;
+                if (dt > 0.0f && dt < 0.1f) {
+                    velocity_ms = velocity_ms * VEL_DECAY + sample.lin_accel_x * dt;
+                }
+            }
+            last_sample_us = sample.timestamp_us;
+
+            // 2. Outer P loop: nudge target pitch to cancel accumulated velocity
+            float dynamic_target = runtime->target_pitch_deg + K_VEL_P * velocity_ms;
+
+            // 3. Get current pitch
             float current_pitch = sample.pitch_deg * PITCH_POLARITY;
             float current_pitch_rate = runtime->current_pose.tilt_rate_dps * PITCH_POLARITY;
-            
-            // 2. PID controller output in step frequency (Hz)
+
+            // 4. Inner PID controller output in step frequency (Hz)
             float total_output = pid_controller_step(&runtime->balance_pid,
-                                                     runtime->target_pitch_deg,
+                                                     dynamic_target,
                                                      current_pitch,
                                                      current_pitch_rate,
                                                      sample.timestamp_us);
-            
-            // 4. Map PID output to wheel commands.
+
+            // 5. Map PID output to wheel commands.
             // Left wheel follows control sign; right wheel is inverted for mirrored drivetrain orientation.
             runtime->test_cmd.left_step_hz = total_output;
             runtime->test_cmd.right_step_hz = -total_output;
 
-            // 5. Apply commands
+            // 6. Apply commands
             motor_module_apply_command(&runtime->motor_hal, &runtime->test_cmd);
         }
     }
@@ -327,11 +377,11 @@ void app_main(void)
     }
 
     TMC2240_RobotConfig_t silent_config = {
-        .run_current_ma = 500,
-        .hold_current_ma = 100,
-        .microsteps = 16,
+        .run_current_ma = 1200,
+        .hold_current_ma = 300,
+        .microsteps = 8,
         .interpolate = true,
-        .stealth_threshold = 500,
+        .stealth_threshold = 0,
         .stall_sensitivity = 0,
         .cool_step_enabled = false,
     };
@@ -346,38 +396,16 @@ void app_main(void)
     g_runtime.motor_hal.right.dir_pin = TMC_RIGHT_DIR;
     g_runtime.motor_hal.right.en_pin = TMC_EN;
     g_runtime.motor_hal.right.en_active_low = true;
-    g_runtime.motor_hal.max_step_hz = 3000.0f;
+    g_runtime.motor_hal.max_step_hz = 1500.0f;
     motor_module_init(&g_runtime.motor_hal);
     motor_module_set_enabled(&g_runtime.motor_hal, false);
 
-    // Motor test: left 3s, right 3s, both 3s
-    ESP_LOGI(TAG, "[MOTOR TEST] LEFT 3s...");
-    {
-        motor_command_t cmd = { .left_step_hz = 1000.0f, .right_step_hz = 0.0f };
-        motor_module_set_enabled(&g_runtime.motor_hal, true);
-        motor_module_apply_command(&g_runtime.motor_hal, &cmd);
-        vTaskDelay(pdMS_TO_TICKS(3000));
-        motor_module_set_enabled(&g_runtime.motor_hal, false);
-    }
-    ESP_LOGI(TAG, "[MOTOR TEST] RIGHT 3s...");
-    {
-        motor_command_t cmd = { .left_step_hz = 0.0f, .right_step_hz = 1000.0f };
-        motor_module_set_enabled(&g_runtime.motor_hal, true);
-        motor_module_apply_command(&g_runtime.motor_hal, &cmd);
-        vTaskDelay(pdMS_TO_TICKS(3000));
-        motor_module_set_enabled(&g_runtime.motor_hal, false);
-    }
-    ESP_LOGI(TAG, "[MOTOR TEST] BOTH 3s...");
-    {
-        motor_command_t cmd = { .left_step_hz = 1000.0f, .right_step_hz = 1000.0f };
-        motor_module_set_enabled(&g_runtime.motor_hal, true);
-        motor_module_apply_command(&g_runtime.motor_hal, &cmd);
-        vTaskDelay(pdMS_TO_TICKS(3000));
-        motor_module_set_enabled(&g_runtime.motor_hal, false);
-    }
-    ESP_LOGI(TAG, "[MOTOR TEST] Done");
-    // Freeze the AT#1 auto-tuning results so StealthChop2 never re-runs the
-    // noisy convergence phase on subsequent start commands.
+    // EN pin is now active (TMC2240 drivers live). Wait for AT#1 standstill
+    // tuning to converge (~130ms), then freeze the learned OFS/GRAD so
+    // StealthChop2 never re-runs the noisy convergence on start commands.
+    // No motor test needed: both EN pins share GPIO 18 so they cannot be
+    // independently gated, and AT#1 converges purely from standstill.
+    vTaskDelay(pdMS_TO_TICKS(200));
     motor_module_tmc2240_freeze_tuning();
 
     // Disable watchdog interrupts to reduce motor control jitter
@@ -404,7 +432,7 @@ void app_main(void)
     pid_controller_init(&g_runtime.balance_pid,
                         400.0f,
                         0.0f,
-                        25.0f,
+                        60.0f,
                         -g_runtime.motor_hal.max_step_hz,
                         g_runtime.motor_hal.max_step_hz);
     g_runtime.target_pitch_deg = 0.0f; // Stand perfectly upright
@@ -416,6 +444,8 @@ void app_main(void)
     } else {
         ESP_LOGI(TAG, "UDP command receiver enabled on port 5555");
     }
+
+    ESP_LOGI(TAG, "FIRMWARE v7 — SpreadCycle KvelP=1.5 VelDecay=0.98");
 
     if (xTaskCreatePinnedToCore(imu_task_fn,
                                 "imu_core0",

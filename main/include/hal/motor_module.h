@@ -47,6 +47,7 @@ esp_err_t motor_module_tmc2240_spi_init(int spi_host,
                                         int spi_clock_hz,
                                         bool right_ctx);
 void motor_module_tmc2240_test_log(void);
+void motor_module_tmc2240_log_config(void);
 void motor_module_tmc2240_configure_robot_mode(const TMC2240_RobotConfig_t *config);
 void motor_module_tmc2240_freeze_tuning(void);
 
