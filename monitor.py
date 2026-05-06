@@ -3,6 +3,8 @@
 # python3 monitor.py
 
 import argparse
+import csv
+import os
 import re
 import select
 import socket
@@ -36,19 +38,28 @@ class RobotMonitor:
         self.right_temp_c = None
         self.left_sg = None
         self.right_sg = None
-        self.kp = 400.0
+        self.left_cs = None
+        self.right_cs = None
+        self.kp = 1500.0 # 1500 good default
         self.ki = 0.0
-        self.kd = 25.0
+        self.kd = 5.0 # 5 good default
         self.target_pitch_deg = 0.0
         self.yaw_deg = 0.0
         self.pitch_deg = 0.0
         self.roll_deg = 0.0
         self.tilt_rate_dps = 0.0
+        self.lin_accel_x = 0.0
         self.last_command = "idle"
         self.is_active = False
 
         self._last_action_key = None
         self._last_action_time = 0.0
+
+        # CSV logging
+        self._csv_file = None
+        self._csv_writer = None
+        self._csv_lock = threading.Lock()
+        self._init_csv()
 
         self.ANSI = {
             'reset': '\x1b[0m',
@@ -59,6 +70,36 @@ class RobotMonitor:
             'yellow': '\x1b[33m',
             'cyan': '\x1b[36m',
         }
+
+    def _init_csv(self):
+        log_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
+        os.makedirs(log_dir, exist_ok=True)
+        filename = datetime.now().strftime("robot_%Y%m%d_%H%M%S.csv")
+        path = os.path.join(log_dir, filename)
+        self._csv_file = open(path, "w", newline="", buffering=1)
+        self._csv_writer = csv.writer(self._csv_file)
+        self._csv_writer.writerow([
+            "timestamp", "pitch_deg", "roll_deg", "yaw_deg", "tilt_rate_dps", "lin_accel_x",
+            "left_temp_c", "right_temp_c", "left_sg", "right_sg",
+            "left_cs", "right_cs",
+            "kp", "ki", "kd", "target_pitch_deg", "is_active",
+        ])
+        print(f"[CSV] Logging to {path}")
+
+    def _csv_log(self):
+        with self._csv_lock:
+            if self._csv_writer is None:
+                return
+            with self.state_lock:
+                row = [
+                    datetime.now().strftime("%H:%M:%S.%f")[:-3],
+                    self.pitch_deg, self.roll_deg, self.yaw_deg, self.tilt_rate_dps, self.lin_accel_x,
+                    self.left_temp_c, self.right_temp_c, self.left_sg, self.right_sg,
+                    self.left_cs, self.right_cs,
+                    self.kp, self.ki, self.kd, self.target_pitch_deg,
+                    1 if self.is_active else 0,
+                ]
+            self._csv_writer.writerow(row)
 
     def _set_state(self, **kwargs):
         with self.state_lock:
@@ -85,6 +126,8 @@ class RobotMonitor:
             right_temp = self._format_float(self.right_temp_c, precision=1)
             left_sg    = self._format_float(self.left_sg, precision=0, empty="--")
             right_sg   = self._format_float(self.right_sg, precision=0, empty="--")
+            left_cs    = str(self.left_cs)  if self.left_cs  is not None else "--"
+            right_cs   = str(self.right_cs) if self.right_cs is not None else "--"
             kp           = self._format_float(self.kp, precision=2)
             ki           = self._format_float(self.ki, precision=2)
             kd           = self._format_float(self.kd, precision=2)
@@ -93,6 +136,7 @@ class RobotMonitor:
             pitch        = self._format_float(self.pitch_deg, precision=1)
             roll         = self._format_float(self.roll_deg, precision=1)
             tilt_rate    = self._format_float(self.tilt_rate_dps, precision=1)
+            lin_accel_x  = self._format_float(self.lin_accel_x, precision=2)
             is_active    = self.is_active
 
         width = shutil.get_terminal_size(fallback=(120, 24)).columns
@@ -101,10 +145,11 @@ class RobotMonitor:
         sep    = self.ANSI['dim'] + "─" * width + self.ANSI['reset']
 
         row1 = (f" Temps   L: {left_temp}°C   R: {right_temp}°C"
+                f"   │   CS   L: {left_cs}   R: {right_cs}"
                 f"   │   SG   L: {left_sg}   R: {right_sg}"
                 f"   │   {status}   {now}")
         row2 = (f" PID     kp: {kp}   ki: {ki}   kd: {kd}   target: {target_pitch}°")
-        row3 = (f" Pose    yaw: {yaw}°   pitch: {pitch}°   roll: {roll}°   rate: {tilt_rate} °/s")
+        row3 = (f" Pose    yaw: {yaw}°   pitch: {pitch}°   roll: {roll}°   rate: {tilt_rate} °/s   accel: {lin_accel_x} m/s²")
 
         return [sep, row1, row2, row3, sep]
 
@@ -125,15 +170,20 @@ class RobotMonitor:
         self._set_state(latest_log_time=now.strftime("%H:%M:%S.%f")[:-3])
 
         tmc_match = re.search(
-            r"TMC\s+[—-]\s+LEFT:\s+([0-9.]+)\s+C.*?SG=(\d+).*\|\s+RIGHT:\s+([0-9.]+)\s+C.*?SG=(\d+)",
+            r"TMC\s+[—-]\s+LEFT:\s+([0-9.]+)\s+C,\s+[0-9.]+\s+mA,\s+CS=(\d+).*?SG=(\d+|stst)"
+            r".*\|\s+RIGHT:\s+([0-9.]+)\s+C,\s+[0-9.]+\s+mA,\s+CS=(\d+).*?SG=(\d+|stst)",
             message,
         )
         if tmc_match:
+            def _parse_sg(s):
+                return None if s == "stst" else float(s)
             self._set_state(
                 left_temp_c=float(tmc_match.group(1)),
-                left_sg=float(tmc_match.group(2)),
-                right_temp_c=float(tmc_match.group(3)),
-                right_sg=float(tmc_match.group(4)),
+                left_cs=int(tmc_match.group(2)),
+                left_sg=_parse_sg(tmc_match.group(3)),
+                right_temp_c=float(tmc_match.group(4)),
+                right_cs=int(tmc_match.group(5)),
+                right_sg=_parse_sg(tmc_match.group(6)),
             )
         else:
             temp_match = re.search(
@@ -194,13 +244,17 @@ class RobotMonitor:
             pitch = float(parts[1])
             roll = float(parts[2])
             tilt_rate = float(parts[3]) if len(parts) >= 4 else None
+            lin_accel_x = float(parts[4]) if len(parts) >= 5 else None
         except ValueError:
             return
 
         update = dict(yaw_deg=yaw, pitch_deg=pitch, roll_deg=roll)
         if tilt_rate is not None:
             update["tilt_rate_dps"] = tilt_rate
+        if lin_accel_x is not None:
+            update["lin_accel_x"] = lin_accel_x
         self._set_state(**update)
+        self._csv_log()
 
     def _listener_loop(self, listen_port, handler, label):
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -347,31 +401,52 @@ class RobotMonitor:
                     self.print_help()
                     continue
 
+                cmd = self._expand_shortcut(cmd)
                 self.send_command(cmd)
         finally:
             # Reset scroll region and leave terminal in a clean state
             sys.stdout.write("\x1b[r\x1b[2J\x1b[H")
             sys.stdout.flush()
 
+        with self._csv_lock:
+            if self._csv_file is not None:
+                self._csv_file.close()
+                self._csv_file = None
+                self._csv_writer = None
         print("[*] Exiting...")
+
+    def _expand_shortcut(self, cmd):
+        parts = cmd.split()
+        if not parts:
+            return cmd
+        key = parts[0].lower()
+        if key in ("tl", "tr"):
+            side = "left" if key == "tl" else "right"
+            hz  = parts[1] if len(parts) > 1 else "3000"
+            ms  = parts[2] if len(parts) > 2 else "3000"
+            return f"motor_test {side} {hz} {ms}"
+        return cmd
 
     def print_help(self):
         with self.print_lock:
             print(
             """
 Available commands:
-  start                    Arm balance control
-  stop                     Disable motors (emergency stop)
-  tune pid <kp> <ki> <kd>  Update PID gains live
-  set target <deg>         Set balance point pitch angle
-  calibrate                Capture current pitch as balance target
-  forward <0-100>          Drive forward at speed %
-  backward <0-100>         Drive backward at speed %
-  left <0-100>             Turn left at speed %
-  right <0-100>            Turn right at speed %
-  watchdog_clear           Clear watchdog trip latch
-  help                     Show this message
-  quit                     Exit monitor
+  start                         Arm balance control
+  stop                          Disable motors (emergency stop)
+  tune pid <kp> <ki> <kd>       Update PID gains live
+  set target <deg>              Set balance point pitch angle
+  calibrate                     Capture current pitch as balance target
+  forward <0-100>               Drive forward at speed %
+  backward <0-100>              Drive backward at speed %
+  left <0-100>                  Turn left at speed %
+  right <0-100>                 Turn right at speed %
+  motor_test left|right|both <hz> [ms]   Spin motor(s) for a timed burst
+  tl [hz] [ms]                  Shortcut: test left motor  (default 3000 Hz, 3000 ms)
+  tr [hz] [ms]                  Shortcut: test right motor (default 3000 Hz, 3000 ms)
+  watchdog_clear                Clear watchdog trip latch
+  help                          Show this message
+  quit                          Exit monitor
             """.rstrip()
         )
 

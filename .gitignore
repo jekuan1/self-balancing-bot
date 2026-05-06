@@ -54,6 +54,9 @@ debug_*.py
 debug_*.txt
 register_dump*.txt
 
+# CSV telemetry logs
+logs/
+
 # Python environment files
 *.pyc
 *.pyo
