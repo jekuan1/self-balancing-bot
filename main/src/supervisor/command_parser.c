@@ -8,6 +8,7 @@
 #include <unistd.h>
 
 #include "esp_log.h"
+#include "hal/motor_module.h"
 #include "robot_control.h"
 
 static const char *TAG = "command_parser";
@@ -193,6 +194,46 @@ static void handle_calibrate(void)
     ESP_LOGI(TAG, "Calibrated: target pitch set to current reading (%.3f deg)", current);
 }
 
+static void handle_motor_test(int argc, char **argv)
+{
+    // motor_test left|right|both <hz> [duration_ms]
+    if (argc < 3) {
+        ESP_LOGW(TAG, "Usage: motor_test left|right|both <hz> [duration_ms]");
+        return;
+    }
+    float hz = 0.0f;
+    if (!parse_float_arg(argv[2], &hz)) {
+        ESP_LOGW(TAG, "motor_test: hz must be numeric");
+        return;
+    }
+    uint32_t duration_ms = 3000;
+    if (argc >= 4) {
+        float d = 0.0f;
+        if (parse_float_arg(argv[3], &d) && d > 0.0f) {
+            duration_ms = (uint32_t)d;
+        }
+    }
+    motor_test_params_t p = {0};
+    if (strcmp(argv[1], "left") == 0) {
+        p.left_hz = hz;
+    } else if (strcmp(argv[1], "right") == 0) {
+        p.right_hz = hz;
+    } else if (strcmp(argv[1], "both") == 0) {
+        p.left_hz  = hz;
+        p.right_hz = hz;
+    } else {
+        ESP_LOGW(TAG, "motor_test: side must be left, right, or both");
+        return;
+    }
+    p.duration_ms = duration_ms;
+    robot_control_send_motor_test(&p);
+}
+
+static void handle_status(void)
+{
+    motor_module_tmc2240_log_config();
+}
+
 static void handle_watchdog_clear(void)
 {
     ESP_LOGI(TAG, "cmd=watchdog_clear (use 'stop' to recover from fault)");
@@ -301,8 +342,12 @@ bool command_parser_poll(command_parser_t *parser, control_setpoint_t *setpoint)
         handle_set_target(argc, argv);
     } else if (strcmp(argv[0], "calibrate") == 0) {
         handle_calibrate();
+    } else if (strcmp(argv[0], "motor_test") == 0) {
+        handle_motor_test(argc, argv);
     } else if (strcmp(argv[0], "watchdog_clear") == 0) {
         handle_watchdog_clear();
+    } else if (strcmp(argv[0], "status") == 0) {
+        handle_status();
     } else if (strcmp(argv[0], "help") == 0) {
         handle_help();
     } else {

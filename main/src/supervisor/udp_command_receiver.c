@@ -1,5 +1,6 @@
 #include "supervisor/udp_command_receiver.h"
 #include "supervisor/command_parser.h"
+#include "hal/motor_module.h"
 #include "robot_control.h"
 
 #include <string.h>
@@ -12,6 +13,7 @@
 
 bool robot_control_send_stop(void);
 bool robot_control_send_start(void);
+bool robot_control_send_motor_test(const motor_test_params_t *params);
 
 static const char *TAG = "udp_cmd_receiver";
 
@@ -153,8 +155,54 @@ static void udp_command_task(void *pvParameters)
                                 ESP_LOGI(TAG, "right speed=%d", speed);
                             }
                         }
+                    } else if (strcmp(argv[0], "motor_test") == 0) {
+                        // motor_test left|right|both <hz> [duration_ms]
+                        if (argc < 3) {
+                            ESP_LOGW(TAG, "Usage: motor_test left|right|both <hz> [duration_ms]");
+                        } else {
+                            float hz = 0.0f;
+                            if (!parse_float_arg(argv[2], &hz)) {
+                                ESP_LOGW(TAG, "motor_test: hz must be numeric");
+                            } else {
+                                motor_test_params_t p = {0};
+                                uint32_t duration_ms = 3000;
+                                if (argc >= 4) {
+                                    float d = 0.0f;
+                                    if (parse_float_arg(argv[3], &d) && d > 0.0f) {
+                                        duration_ms = (uint32_t)d;
+                                    }
+                                }
+                                bool side_ok = true;
+                                if (strcmp(argv[1], "left") == 0) {
+                                    p.left_hz = hz;
+                                } else if (strcmp(argv[1], "right") == 0) {
+                                    p.right_hz = hz;
+                                } else if (strcmp(argv[1], "both") == 0) {
+                                    p.left_hz  = hz;
+                                    p.right_hz = hz;
+                                } else {
+                                    ESP_LOGW(TAG, "motor_test: side must be left, right, or both");
+                                    side_ok = false;
+                                }
+                                if (side_ok) {
+                                    p.duration_ms = duration_ms;
+                                    robot_control_send_motor_test(&p);
+                                }
+                            }
+                        }
+                    } else if (strcmp(argv[0], "set") == 0) {
+                        if (argc >= 3 && strcmp(argv[1], "target") == 0) {
+                            float pitch = 0.0f;
+                            if (parse_float_arg(argv[2], &pitch)) {
+                                robot_control_set_target(pitch);
+                            }
+                        }
+                    } else if (strcmp(argv[0], "calibrate") == 0) {
+                        robot_control_set_target(robot_control_get_pitch());
                     } else if (strcmp(argv[0], "watchdog_clear") == 0) {
                         ESP_LOGI(TAG, "watchdog_clear");
+                    } else if (strcmp(argv[0], "status") == 0) {
+                        motor_module_tmc2240_log_config();
                     } else {
                         ESP_LOGW(TAG, "Unknown command: %s", argv[0]);
                     }
