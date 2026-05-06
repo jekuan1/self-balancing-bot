@@ -19,6 +19,7 @@ typedef struct {
     float pitch_deg;
     float yaw_deg;
     float gyro_pitch_dps;
+    float lin_accel_x;
     int64_t timestamp_us;
 } imu_sample_t;
 
@@ -28,6 +29,7 @@ typedef struct {
     float roll_deg;
     float tilt_deg;
     float tilt_rate_dps;
+    float lin_accel_x;
     int64_t timestamp_us;
 } robot_pose_t;
 

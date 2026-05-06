@@ -49,12 +49,13 @@ void telemetry_comms_publish(telemetry_comms_t *telemetry, robot_state_t state, 
 
     // 2. Send over UDP as CSV: "yaw,pitch,roll,tilt_rate"
     if (s_udp_sock >= 0) {
-        char payload[80];
-        int len = snprintf(payload, sizeof(payload), "%.2f,%.2f,%.2f,%.2f\n",
+        char payload[96];
+        int len = snprintf(payload, sizeof(payload), "%.2f,%.2f,%.2f,%.2f,%.3f\n",
                            pose->yaw_deg,
                            pose->pitch_deg,
                            pose->roll_deg,
-                           pose->tilt_rate_dps);
+                           pose->tilt_rate_dps,
+                           pose->lin_accel_x);
 
         sendto(s_udp_sock, payload, len, 0, (struct sockaddr *)&s_dest_addr, sizeof(s_dest_addr));
     }

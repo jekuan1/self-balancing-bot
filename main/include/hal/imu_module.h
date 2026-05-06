@@ -33,8 +33,10 @@ typedef struct {
     float pitch_deg;
     float roll_deg;
     float gyro_pitch_dps;
+    float lin_accel_x;
     bool orientation_valid;
     bool gyro_valid;
+    bool lin_accel_valid;
     uint8_t control_seq;
     float tilt_zero_deg;
 
