@@ -19,15 +19,20 @@ void telemetry_comms_init(telemetry_comms_t *telemetry)
         ESP_LOGE(TAG, "Unable to create socket: errno %d", errno);
         return;
     }
+    ESP_LOGI(TAG, "Socket created successfully");
 
     // Enable broadcast
     int broadcast = 1;
-    setsockopt(s_udp_sock, SOL_SOCKET, SO_BROADCAST, &broadcast, sizeof(broadcast));
+    if (setsockopt(s_udp_sock, SOL_SOCKET, SO_BROADCAST, &broadcast, sizeof(broadcast)) < 0) {
+        ESP_LOGE(TAG, "Failed to set broadcast option: errno %d", errno);
+    }
 
     // Set destination to broadcast address on the AP network
     s_dest_addr.sin_addr.s_addr = inet_addr("192.168.4.255");
     s_dest_addr.sin_family = AF_INET;
     s_dest_addr.sin_port = htons(1234); // Port 1234
+    
+    ESP_LOGI(TAG, "Broadcasting to 192.168.4.255:1234");
 }
 
 void telemetry_comms_publish(telemetry_comms_t *telemetry, robot_state_t state, const robot_pose_t *pose)
@@ -41,17 +46,15 @@ void telemetry_comms_publish(telemetry_comms_t *telemetry, robot_state_t state, 
     }
     telemetry->last_publish_us = now_us;
 
-    // Log to console
-    // ESP_LOGD(TAG, "Y=%.2f P=%.2f R=%.2f", pose->yaw_deg, pose->pitch_deg, pose->roll_deg);
+    // 1. Log to console as before
+    ESP_LOGD(TAG, "Y=%.2f P=%.2f R=%.2f", pose->yaw_deg, pose->pitch_deg, pose->roll_deg);
 
-    // Send data over UDP
+    // 2. Send over UDP
     if (s_udp_sock >= 0) {
-        // Simple CSV format: "timestamp_us,yaw,tilt,tilt_rate\n"
         char payload[64];
-        int len = snprintf(payload, sizeof(payload), "%" PRId64 ",%.2f,%.2f,%.2f\n", 
-                           pose->timestamp_us, pose->yaw_deg, pose->tilt_deg, pose->tilt_rate_dps);
+        int len = snprintf(payload, sizeof(payload), "%.2f,%.2f,%.2f\n", 
+                           pose->yaw_deg, pose->pitch_deg, pose->roll_deg);
         
         sendto(s_udp_sock, payload, len, 0, (struct sockaddr *)&s_dest_addr, sizeof(s_dest_addr));
-
     }
 }
