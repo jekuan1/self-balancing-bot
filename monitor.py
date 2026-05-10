@@ -40,12 +40,12 @@ class RobotMonitor:
         self.right_sg = None
         self.left_cs = None
         self.right_cs = None
-        self.kp = 1500.0 # 1500 good default
+        self.kp = 600.0
         self.ki = 0.0
-        self.kd = 5.0 # 5 good default
+        self.kd = 20.0
         self.target_pitch_deg = 0.0
         self.dynamic_target_pitch_deg = 0.0
-        self.velocity_gain = 1.5
+        self.velocity_gain = 10.0
         self.control_output_hz = 0.0
         self.max_step_hz = 1500.0
         self.saturation_pct = 0.0
@@ -541,7 +541,7 @@ class RobotMonitor:
             preset = parts[1].lower()
             presets = {
                 "soft": (250.0, 0.0, 25.0, 1000.0),
-                "base": (400.0, 0.0, 60.0, 1500.0),
+                "base": (600.0, 0.0, 20.0, 1500.0),
                 "strong": (700.0, 0.0, 90.0, 2500.0),
             }
             if preset in presets:

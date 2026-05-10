@@ -3,6 +3,7 @@
 #include "driver/spi_master.h"
 #include "esp_err.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/queue.h"
@@ -29,7 +30,12 @@ static const char *TAG = "motor_test";
 #define DEFAULT_MAX_STEP_HZ 1500.0f
 #define HARD_MAX_STEP_HZ 5000.0f
 #define MIN_MAX_STEP_HZ 100.0f
-#define DEFAULT_VELOCITY_GAIN 1.5f
+#define DEFAULT_PID_KP 600.0f
+#define DEFAULT_PID_KI 0.0f
+#define DEFAULT_PID_KD 20.0f
+#define DEFAULT_VELOCITY_GAIN 10.0f
+#define BALANCE_PERIOD_US 10000
+#define IMU_TIMEOUT_SAMPLES 5
 
 typedef struct {
     imu_module_t imu;
@@ -41,6 +47,8 @@ typedef struct {
     pid_controller_t balance_pid;
     state_estimator_t state_estimator;
     telemetry_comms_t telemetry_comms;
+    TaskHandle_t control_task_handle;
+    esp_timer_handle_t balance_timer_handle;
     robot_pose_t current_pose;
     float target_pitch_deg;
     float dynamic_target_pitch_deg;
@@ -51,13 +59,38 @@ typedef struct {
 
 static robot_runtime_t g_runtime = {0};
 static volatile motor_test_params_t g_motor_test_params = {0};
+static volatile bool g_estop_requested = false;
+static volatile bool g_balance_tick_requested = false;
+static volatile bool g_imu_timeout_latched = false;
+
+static void notify_control_task(void)
+{
+    if (g_runtime.control_task_handle != NULL) {
+        xTaskNotifyGive(g_runtime.control_task_handle);
+    }
+}
+
+static void balance_timer_callback(void *arg)
+{
+    (void)arg;
+    g_balance_tick_requested = true;
+    notify_control_task();
+}
 
 bool robot_control_send_command(robot_control_command_t command)
 {
+    if (command == ROBOT_CONTROL_CMD_STOP) {
+        g_estop_requested = true;
+        notify_control_task();
+    }
+
     if (g_runtime.control_cmd_queue == NULL) {
         return false;
     }
-    return xQueueOverwrite(g_runtime.control_cmd_queue, &command) == pdTRUE;
+
+    bool ok = xQueueOverwrite(g_runtime.control_cmd_queue, &command) == pdTRUE;
+    notify_control_task();
+    return ok;
 }
 
 bool robot_control_send_stop(void)
@@ -67,6 +100,8 @@ bool robot_control_send_stop(void)
 
 bool robot_control_send_start(void)
 {
+    g_estop_requested = false;
+    g_imu_timeout_latched = false;
     return robot_control_send_command(ROBOT_CONTROL_CMD_START);
 }
 
@@ -216,9 +251,27 @@ static void control_task_fn(void *arg)
     float velocity_ms = 0.0f;
     int64_t last_sample_us = 0;
     uint32_t missed_imu_samples = 0;
-    TickType_t last_wake = xTaskGetTickCount();
 
     while (1) {
+        (void)ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+
+        if (g_estop_requested) {
+            runtime->test_cmd.left_step_hz = 0.0f;
+            runtime->test_cmd.right_step_hz = 0.0f;
+            motor_module_apply_command(&runtime->motor_hal, &runtime->test_cmd);
+            motor_module_set_enabled(&runtime->motor_hal, false);
+            pid_controller_reset(&runtime->balance_pid);
+            velocity_ms = 0.0f;
+            last_sample_us = 0;
+            missed_imu_samples = 0;
+            runtime->control_output_hz = 0.0f;
+            runtime->dynamic_target_pitch_deg = runtime->target_pitch_deg;
+            runtime->control_active = false;
+            stopped = true;
+            g_estop_requested = false;
+            ESP_LOGW(TAG, "E-STOP event: motors disabled");
+        }
+
         robot_control_command_t command = ROBOT_CONTROL_CMD_NONE;
         if (runtime->control_cmd_queue != NULL && xQueueReceive(runtime->control_cmd_queue, &command, 0) == pdTRUE) {
             if (command == ROBOT_CONTROL_CMD_STOP) {
@@ -236,6 +289,8 @@ static void control_task_fn(void *arg)
                 stopped = true;
                 ESP_LOGW(TAG, "STOP command received: motors disabled");
             } else if (command == ROBOT_CONTROL_CMD_START) {
+                g_estop_requested = false;
+                g_imu_timeout_latched = false;
                 motor_module_set_enabled(&runtime->motor_hal, true);
                 pid_controller_reset(&runtime->balance_pid);
                 velocity_ms = 0.0f;
@@ -257,7 +312,15 @@ static void control_task_fn(void *arg)
                 runtime->test_cmd.left_step_hz  = p.left_hz;
                 runtime->test_cmd.right_step_hz = p.right_hz;
                 motor_module_apply_command(&runtime->motor_hal, &runtime->test_cmd);
-                vTaskDelay(pdMS_TO_TICKS(p.duration_ms));
+                TickType_t test_start = xTaskGetTickCount();
+                TickType_t test_duration = pdMS_TO_TICKS(p.duration_ms);
+                while ((xTaskGetTickCount() - test_start) < test_duration) {
+                    if (g_estop_requested) {
+                        ESP_LOGW(TAG, "MOTOR_TEST interrupted by E-STOP");
+                        break;
+                    }
+                    vTaskDelay(pdMS_TO_TICKS(10));
+                }
                 runtime->test_cmd.left_step_hz  = 0.0f;
                 runtime->test_cmd.right_step_hz = 0.0f;
                 motor_module_apply_command(&runtime->motor_hal, &runtime->test_cmd);
@@ -268,15 +331,21 @@ static void control_task_fn(void *arg)
                 missed_imu_samples = 0;
                 runtime->control_active = false;
                 stopped = true;
-                last_wake = xTaskGetTickCount();
+                (void)ulTaskNotifyTake(pdTRUE, 0);
+                g_balance_tick_requested = false;
                 ESP_LOGI(TAG, "MOTOR_TEST done");
             }
         }
 
         if (stopped) {
-            vTaskDelayUntil(&last_wake, pdMS_TO_TICKS(10));
+            g_balance_tick_requested = false;
             continue;
         }
+
+        if (!g_balance_tick_requested) {
+            continue;
+        }
+        g_balance_tick_requested = false;
 
         if (runtime->imu.i2c_dev != NULL) {
             // Poll IMU, update pose, run PID, and apply motor command in one
@@ -320,20 +389,31 @@ static void control_task_fn(void *arg)
 
                 // 6. Apply commands
                 motor_module_apply_command(&runtime->motor_hal, &runtime->test_cmd);
-            } else if (++missed_imu_samples >= 5) {
+            } else if (++missed_imu_samples >= IMU_TIMEOUT_SAMPLES) {
+                if (!g_imu_timeout_latched) {
+                    g_imu_timeout_latched = true;
+                    g_estop_requested = true;
+                    notify_control_task();
+                    ESP_LOGE(TAG, "IMU timeout watchdog: no valid samples for %u balance ticks",
+                             (unsigned)IMU_TIMEOUT_SAMPLES);
+                }
                 runtime->test_cmd.left_step_hz = 0.0f;
                 runtime->test_cmd.right_step_hz = 0.0f;
                 runtime->control_output_hz = 0.0f;
                 motor_module_apply_command(&runtime->motor_hal, &runtime->test_cmd);
             }
         } else {
+            if (!g_imu_timeout_latched) {
+                g_imu_timeout_latched = true;
+                g_estop_requested = true;
+                notify_control_task();
+                ESP_LOGE(TAG, "IMU timeout watchdog: IMU device unavailable");
+            }
             runtime->test_cmd.left_step_hz = 0.0f;
             runtime->test_cmd.right_step_hz = 0.0f;
             runtime->control_output_hz = 0.0f;
             motor_module_apply_command(&runtime->motor_hal, &runtime->test_cmd);
         }
-
-        vTaskDelayUntil(&last_wake, pdMS_TO_TICKS(10));
     }
 }
 
@@ -499,9 +579,9 @@ void app_main(void)
 
     // Initialize PID config
     pid_controller_init(&g_runtime.balance_pid,
-                        400.0f,
-                        0.0f,
-                        60.0f,
+                        DEFAULT_PID_KP,
+                        DEFAULT_PID_KI,
+                        DEFAULT_PID_KD,
                         -g_runtime.motor_hal.max_step_hz,
                         g_runtime.motor_hal.max_step_hz);
     g_runtime.target_pitch_deg = 0.0f; // Stand perfectly upright
@@ -523,11 +603,21 @@ void app_main(void)
                                 4096,
                                 &g_runtime,
                                 5, // Highest priority
-                                NULL,
+                                &g_runtime.control_task_handle,
                                 1) != pdPASS) {
         ESP_LOGE(TAG, "Failed to create control task on Core 1");
         return;
     }
+
+    const esp_timer_create_args_t balance_timer_args = {
+        .callback = balance_timer_callback,
+        .arg = &g_runtime,
+        .dispatch_method = ESP_TIMER_TASK,
+        .name = "balance_timer",
+    };
+    ESP_ERROR_CHECK(esp_timer_create(&balance_timer_args, &g_runtime.balance_timer_handle));
+    ESP_ERROR_CHECK(esp_timer_start_periodic(g_runtime.balance_timer_handle, BALANCE_PERIOD_US));
+    ESP_LOGI(TAG, "Balance timer event enabled at %u us", (unsigned)BALANCE_PERIOD_US);
 
     if (xTaskCreatePinnedToCore(supervisor_task_fn,
                                 "supervisor_core0",

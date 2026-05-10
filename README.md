@@ -67,6 +67,17 @@ To save the plot:
 python3 plot_robot_log.py logs/<log-file>.csv --save plots/run.png --no-show
 ```
 
+## Control events
+
+The firmware now has four interrupt/event-style sources:
+
+- Software e-stop event: send `stop` from `monitor.py`; the control task is woken immediately and commands both motors to `0 Hz`.
+- Motor step timer: already active in `motor_module.c`; it services step pulses every `10 us`.
+- Balance timer: wakes the control task every `10 ms` to poll the IMU, run PID, and apply motor commands.
+- IMU timeout watchdog: if 5 balance ticks pass without a valid IMU sample, it triggers the same e-stop path.
+
+Normal drive/tuning commands still arrive through UDP and wake the control task, but balance and e-stop handling take priority.
+
 ## Repository structure
 
 ESP-IDF projects are built using CMake. The project build configuration is contained in `CMakeLists.txt` files that provide set of directives and instructions describing the project's source files and targets (executable, library, or both).
