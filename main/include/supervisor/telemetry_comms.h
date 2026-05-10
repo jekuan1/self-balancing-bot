@@ -9,6 +9,15 @@ typedef struct {
 } telemetry_comms_t;
 
 void telemetry_comms_init(telemetry_comms_t *telemetry);
-void telemetry_comms_publish(telemetry_comms_t *telemetry, robot_state_t state, const robot_pose_t *pose);
+void telemetry_comms_publish(telemetry_comms_t *telemetry,
+                             robot_state_t state,
+                             const robot_pose_t *pose,
+                             float target_pitch_deg,
+                             float dynamic_target_pitch_deg,
+                             float control_output_hz,
+                             float max_step_hz,
+                             float left_step_hz,
+                             float right_step_hz,
+                             bool control_active);
 
 #endif

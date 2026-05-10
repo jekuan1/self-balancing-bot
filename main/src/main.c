@@ -26,13 +26,15 @@ static const char *TAG = "motor_test";
 #define ENABLE_OTA_AP 1
 #define OTA_AP_SSID "BalanceBot"
 #define OTA_AP_PASSWORD "balance123"
+#define DEFAULT_MAX_STEP_HZ 1500.0f
+#define HARD_MAX_STEP_HZ 5000.0f
+#define MIN_MAX_STEP_HZ 100.0f
 
 typedef struct {
     imu_module_t imu;
     motor_module_t motor_hal;
     safety_watchdog_t safety_watchdog;
     motor_command_t test_cmd;
-    QueueHandle_t imu_queue;
     QueueHandle_t control_cmd_queue;
     command_parser_t command_parser;
     pid_controller_t balance_pid;
@@ -40,6 +42,9 @@ typedef struct {
     telemetry_comms_t telemetry_comms;
     robot_pose_t current_pose;
     float target_pitch_deg;
+    float dynamic_target_pitch_deg;
+    float control_output_hz;
+    bool control_active;
 } robot_runtime_t;
 
 static robot_runtime_t g_runtime = {0};
@@ -82,6 +87,29 @@ bool robot_control_tune_pid(float kp, float ki, float kd)
     return true;
 }
 
+bool robot_control_set_max_step_hz(float max_step_hz)
+{
+    if (max_step_hz < MIN_MAX_STEP_HZ) {
+        max_step_hz = MIN_MAX_STEP_HZ;
+    }
+    if (max_step_hz > HARD_MAX_STEP_HZ) {
+        max_step_hz = HARD_MAX_STEP_HZ;
+    }
+
+    g_runtime.motor_hal.max_step_hz = max_step_hz;
+    g_runtime.balance_pid.out_min = -max_step_hz;
+    g_runtime.balance_pid.out_max = max_step_hz;
+
+    g_runtime.test_cmd.left_step_hz = g_runtime.motor_hal.left.target_hz;
+    g_runtime.test_cmd.right_step_hz = g_runtime.motor_hal.right.target_hz;
+    motor_module_apply_command(&g_runtime.motor_hal, &g_runtime.test_cmd);
+    pid_controller_reset(&g_runtime.balance_pid);
+
+    ESP_LOGI(TAG, "Motor max step rate set: %.1f Hz (allowed %.1f-%.1f Hz)",
+             (double)max_step_hz, (double)MIN_MAX_STEP_HZ, (double)HARD_MAX_STEP_HZ);
+    return true;
+}
+
 bool robot_control_set_target(float pitch_deg)
 {
     g_runtime.target_pitch_deg = pitch_deg;
@@ -93,6 +121,11 @@ bool robot_control_set_target(float pitch_deg)
 float robot_control_get_pitch(void)
 {
     return g_runtime.current_pose.pitch_deg;
+}
+
+float robot_control_get_max_step_hz(void)
+{
+    return g_runtime.motor_hal.max_step_hz;
 }
 
 static void maybe_start_ota_services(void)
@@ -145,36 +178,10 @@ static void maybe_start_ota_services(void)
 #define TMC_RIGHT_SPI_CS    GPIO_NUM_39
 #define TMC_RIGHT_DIAG0     GPIO_NUM_41
 
-static void imu_task_fn(void *arg)
-{
-    robot_runtime_t *runtime = (robot_runtime_t *)arg;
-    if (runtime == NULL || runtime->imu_queue == NULL) {
-        vTaskDelete(NULL);
-        return;
-    }
-
-    TickType_t last_wake = xTaskGetTickCount();
-    while (1) {
-        if (runtime->imu.i2c_dev != NULL) {
-            // Poll the IMU. In the future, this can be triggered by a hardware INT pin.
-            imu_module_poll_and_log(&runtime->imu);
-            
-            imu_sample_t sample;
-            if (imu_module_read_sample(&runtime->imu, &sample) == ESP_OK) {
-                state_estimator_update(&runtime->state_estimator, &sample, &runtime->current_pose);
-                // Send the sample to the control task, overwriting if queue is full
-                xQueueOverwrite(runtime->imu_queue, &sample);
-            }
-        }
-        // Poll at 100Hz
-        vTaskDelayUntil(&last_wake, pdMS_TO_TICKS(10));
-    }
-}
-
 static void control_task_fn(void *arg)
 {
     robot_runtime_t *runtime = (robot_runtime_t *)arg;
-    if (runtime == NULL || runtime->imu_queue == NULL) {
+    if (runtime == NULL) {
         vTaskDelete(NULL);
         return;
     }
@@ -190,9 +197,11 @@ static void control_task_fn(void *arg)
     // then nudges target_pitch to cancel drift. K_VEL_P converts m/s to degrees
     // of pitch offset. VEL_DECAY bleeds the integrator to prevent bias accumulation.
     const float K_VEL_P  = 1.5f;   // deg per (m/s) — tune this
-    const float VEL_DECAY = 0.98f;  // per sample (~50Hz → τ ≈ 1s)
+    const float VEL_DECAY = 0.98f;  // per sample (~100Hz)
     float velocity_ms = 0.0f;
     int64_t last_sample_us = 0;
+    uint32_t missed_imu_samples = 0;
+    TickType_t last_wake = xTaskGetTickCount();
 
     while (1) {
         robot_control_command_t command = ROBOT_CONTROL_CMD_NONE;
@@ -205,6 +214,10 @@ static void control_task_fn(void *arg)
                 pid_controller_reset(&runtime->balance_pid);
                 velocity_ms = 0.0f;
                 last_sample_us = 0;
+                missed_imu_samples = 0;
+                runtime->control_output_hz = 0.0f;
+                runtime->dynamic_target_pitch_deg = runtime->target_pitch_deg;
+                runtime->control_active = false;
                 stopped = true;
                 ESP_LOGW(TAG, "STOP command received: motors disabled");
             } else if (command == ROBOT_CONTROL_CMD_START) {
@@ -212,6 +225,10 @@ static void control_task_fn(void *arg)
                 pid_controller_reset(&runtime->balance_pid);
                 velocity_ms = 0.0f;
                 last_sample_us = 0;
+                missed_imu_samples = 0;
+                runtime->control_output_hz = 0.0f;
+                runtime->dynamic_target_pitch_deg = runtime->target_pitch_deg;
+                runtime->control_active = true;
                 stopped = false;
                 ESP_LOGI(TAG, "START command received: motors enabled");
             } else if (command == ROBOT_CONTROL_CMD_MOTOR_TEST) {
@@ -230,49 +247,78 @@ static void control_task_fn(void *arg)
                 runtime->test_cmd.right_step_hz = 0.0f;
                 motor_module_apply_command(&runtime->motor_hal, &runtime->test_cmd);
                 motor_module_set_enabled(&runtime->motor_hal, false);
+                runtime->control_output_hz = 0.0f;
+                velocity_ms = 0.0f;
+                last_sample_us = 0;
+                missed_imu_samples = 0;
+                runtime->control_active = false;
+                stopped = true;
+                last_wake = xTaskGetTickCount();
                 ESP_LOGI(TAG, "MOTOR_TEST done");
             }
         }
 
         if (stopped) {
-            vTaskDelay(pdMS_TO_TICKS(10));
+            vTaskDelayUntil(&last_wake, pdMS_TO_TICKS(10));
             continue;
         }
 
-        imu_sample_t sample;
-        // Block indefinitely until new IMU data arrives from the IMU task
-        if (xQueueReceive(runtime->imu_queue, &sample, portMAX_DELAY) == pdTRUE) {
-            // 1. Integrate linear acceleration to estimate velocity
-            if (last_sample_us != 0) {
-                float dt = (float)(sample.timestamp_us - last_sample_us) * 1e-6f;
-                if (dt > 0.0f && dt < 0.1f) {
-                    velocity_ms = velocity_ms * VEL_DECAY + sample.lin_accel_x * dt;
+        if (runtime->imu.i2c_dev != NULL) {
+            // Poll IMU, update pose, run PID, and apply motor command in one
+            // high-priority cycle to avoid queue latency between sensing/control.
+            imu_module_poll_and_log(&runtime->imu);
+
+            imu_sample_t sample;
+            if (imu_module_read_sample(&runtime->imu, &sample) == ESP_OK) {
+                missed_imu_samples = 0;
+                state_estimator_update(&runtime->state_estimator, &sample, &runtime->current_pose);
+
+                // 1. Integrate linear acceleration to estimate velocity
+                if (last_sample_us != 0) {
+                    float dt = (float)(sample.timestamp_us - last_sample_us) * 1e-6f;
+                    if (dt > 0.0f && dt < 0.1f) {
+                        velocity_ms = velocity_ms * VEL_DECAY + sample.lin_accel_x * dt;
+                    }
                 }
+                last_sample_us = sample.timestamp_us;
+
+                // 2. Outer P loop: nudge target pitch to cancel accumulated velocity
+                float dynamic_target = runtime->target_pitch_deg + K_VEL_P * velocity_ms;
+                runtime->dynamic_target_pitch_deg = dynamic_target;
+
+                // 3. Get current pitch
+                float current_pitch = sample.pitch_deg * PITCH_POLARITY;
+                float current_pitch_rate = runtime->current_pose.tilt_rate_dps * PITCH_POLARITY;
+
+                // 4. Inner PID controller output in step frequency (Hz)
+                float total_output = pid_controller_step(&runtime->balance_pid,
+                                                         dynamic_target,
+                                                         current_pitch,
+                                                         current_pitch_rate,
+                                                         sample.timestamp_us);
+                runtime->control_output_hz = total_output;
+
+                // 5. Map PID output to wheel commands.
+                // Left wheel follows control sign; right wheel is inverted for mirrored drivetrain orientation.
+                runtime->test_cmd.left_step_hz = total_output;
+                runtime->test_cmd.right_step_hz = -total_output;
+
+                // 6. Apply commands
+                motor_module_apply_command(&runtime->motor_hal, &runtime->test_cmd);
+            } else if (++missed_imu_samples >= 5) {
+                runtime->test_cmd.left_step_hz = 0.0f;
+                runtime->test_cmd.right_step_hz = 0.0f;
+                runtime->control_output_hz = 0.0f;
+                motor_module_apply_command(&runtime->motor_hal, &runtime->test_cmd);
             }
-            last_sample_us = sample.timestamp_us;
-
-            // 2. Outer P loop: nudge target pitch to cancel accumulated velocity
-            float dynamic_target = runtime->target_pitch_deg + K_VEL_P * velocity_ms;
-
-            // 3. Get current pitch
-            float current_pitch = sample.pitch_deg * PITCH_POLARITY;
-            float current_pitch_rate = runtime->current_pose.tilt_rate_dps * PITCH_POLARITY;
-
-            // 4. Inner PID controller output in step frequency (Hz)
-            float total_output = pid_controller_step(&runtime->balance_pid,
-                                                     dynamic_target,
-                                                     current_pitch,
-                                                     current_pitch_rate,
-                                                     sample.timestamp_us);
-
-            // 5. Map PID output to wheel commands.
-            // Left wheel follows control sign; right wheel is inverted for mirrored drivetrain orientation.
-            runtime->test_cmd.left_step_hz = total_output;
-            runtime->test_cmd.right_step_hz = -total_output;
-
-            // 6. Apply commands
+        } else {
+            runtime->test_cmd.left_step_hz = 0.0f;
+            runtime->test_cmd.right_step_hz = 0.0f;
+            runtime->control_output_hz = 0.0f;
             motor_module_apply_command(&runtime->motor_hal, &runtime->test_cmd);
         }
+
+        vTaskDelayUntil(&last_wake, pdMS_TO_TICKS(10));
     }
 }
 
@@ -306,7 +352,16 @@ static void supervisor_task_fn(void *arg)
         TickType_t now = xTaskGetTickCount();
         
         // Publish telemetry at 50Hz (via telemetry_comms internal rate limiting)
-        telemetry_comms_publish(&runtime->telemetry_comms, ROBOT_STATE_READY, &runtime->current_pose);
+        telemetry_comms_publish(&runtime->telemetry_comms,
+                                ROBOT_STATE_READY,
+                                &runtime->current_pose,
+                                runtime->target_pitch_deg,
+                                runtime->dynamic_target_pitch_deg,
+                                runtime->control_output_hz,
+                                runtime->motor_hal.max_step_hz,
+                                runtime->motor_hal.left.target_hz,
+                                runtime->motor_hal.right.target_hz,
+                                runtime->control_active);
         
         // Log TMC temps at 1Hz
         if ((now - last_log_tick) >= pdMS_TO_TICKS(1000)) {
@@ -396,7 +451,7 @@ void app_main(void)
     g_runtime.motor_hal.right.dir_pin = TMC_RIGHT_DIR;
     g_runtime.motor_hal.right.en_pin = TMC_EN;
     g_runtime.motor_hal.right.en_active_low = true;
-    g_runtime.motor_hal.max_step_hz = 1500.0f;
+    g_runtime.motor_hal.max_step_hz = DEFAULT_MAX_STEP_HZ;
     motor_module_init(&g_runtime.motor_hal);
     motor_module_set_enabled(&g_runtime.motor_hal, false);
 
@@ -414,8 +469,6 @@ void app_main(void)
     g_runtime.safety_watchdog.diag_right_io = -1;
     safety_watchdog_init(&g_runtime.safety_watchdog);
 
-    // Initialize IMU Queue (Length 1, so we always only process the newest data)
-    g_runtime.imu_queue = xQueueCreate(1, sizeof(imu_sample_t));
     // Initialize control command queue (Length 1, overwrite keeps only latest command)
     g_runtime.control_cmd_queue = xQueueCreate(1, sizeof(robot_control_command_t));
     if (g_runtime.control_cmd_queue == NULL) {
@@ -445,18 +498,7 @@ void app_main(void)
         ESP_LOGI(TAG, "UDP command receiver enabled on port 5555");
     }
 
-    ESP_LOGI(TAG, "FIRMWARE v7 — SpreadCycle KvelP=1.5 VelDecay=0.98");
-
-    if (xTaskCreatePinnedToCore(imu_task_fn,
-                                "imu_core0",
-                                4096,
-                                &g_runtime,
-                                4,
-                                NULL,
-                                0) != pdPASS) {
-        ESP_LOGE(TAG, "Failed to create IMU task on Core 0");
-        return;
-    }
+    ESP_LOGI(TAG, "FIRMWARE v8 — Combined 100Hz IMU/control loop");
 
     if (xTaskCreatePinnedToCore(control_task_fn,
                                 "control_core1",

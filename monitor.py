@@ -44,6 +44,12 @@ class RobotMonitor:
         self.ki = 0.0
         self.kd = 5.0 # 5 good default
         self.target_pitch_deg = 0.0
+        self.dynamic_target_pitch_deg = 0.0
+        self.control_output_hz = 0.0
+        self.max_step_hz = 1500.0
+        self.saturation_pct = 0.0
+        self.left_step_hz = 0.0
+        self.right_step_hz = 0.0
         self.yaw_deg = 0.0
         self.pitch_deg = 0.0
         self.roll_deg = 0.0
@@ -82,7 +88,9 @@ class RobotMonitor:
             "timestamp", "pitch_deg", "roll_deg", "yaw_deg", "tilt_rate_dps", "lin_accel_x",
             "left_temp_c", "right_temp_c", "left_sg", "right_sg",
             "left_cs", "right_cs",
-            "kp", "ki", "kd", "target_pitch_deg", "is_active",
+            "kp", "ki", "kd", "target_pitch_deg", "dynamic_target_pitch_deg",
+            "control_output_hz", "max_step_hz", "saturation_pct",
+            "left_step_hz", "right_step_hz", "is_active",
         ])
         print(f"[CSV] Logging to {path}")
 
@@ -91,12 +99,17 @@ class RobotMonitor:
             if self._csv_writer is None:
                 return
             with self.state_lock:
+                if not self.is_active:
+                    return
                 row = [
                     datetime.now().strftime("%H:%M:%S.%f")[:-3],
                     self.pitch_deg, self.roll_deg, self.yaw_deg, self.tilt_rate_dps, self.lin_accel_x,
                     self.left_temp_c, self.right_temp_c, self.left_sg, self.right_sg,
                     self.left_cs, self.right_cs,
                     self.kp, self.ki, self.kd, self.target_pitch_deg,
+                    self.dynamic_target_pitch_deg, self.control_output_hz,
+                    self.max_step_hz, self.saturation_pct,
+                    self.left_step_hz, self.right_step_hz,
                     1 if self.is_active else 0,
                 ]
             self._csv_writer.writerow(row)
@@ -132,6 +145,12 @@ class RobotMonitor:
             ki           = self._format_float(self.ki, precision=2)
             kd           = self._format_float(self.kd, precision=2)
             target_pitch = self._format_float(self.target_pitch_deg, precision=2)
+            dynamic_target = self._format_float(self.dynamic_target_pitch_deg, precision=2)
+            output_hz    = self._format_float(self.control_output_hz, precision=0)
+            max_hz       = self._format_float(self.max_step_hz, precision=0)
+            sat_pct      = self._format_float(self.saturation_pct, precision=0)
+            left_hz      = self._format_float(self.left_step_hz, precision=0)
+            right_hz     = self._format_float(self.right_step_hz, precision=0)
             yaw          = self._format_float(self.yaw_deg, precision=1)
             pitch        = self._format_float(self.pitch_deg, precision=1)
             roll         = self._format_float(self.roll_deg, precision=1)
@@ -148,10 +167,11 @@ class RobotMonitor:
                 f"   │   CS   L: {left_cs}   R: {right_cs}"
                 f"   │   SG   L: {left_sg}   R: {right_sg}"
                 f"   │   {status}   {now}")
-        row2 = (f" PID     kp: {kp}   ki: {ki}   kd: {kd}   target: {target_pitch}°")
-        row3 = (f" Pose    yaw: {yaw}°   pitch: {pitch}°   roll: {roll}°   rate: {tilt_rate} °/s   accel: {lin_accel_x} m/s²")
+        row2 = (f" PID     kp: {kp}   ki: {ki}   kd: {kd}   target: {target_pitch}°   dyn: {dynamic_target}°")
+        row3 = (f" Motor   out: {output_hz} Hz   L: {left_hz} Hz   R: {right_hz} Hz   cap: {max_hz} Hz   sat: {sat_pct}%")
+        row4 = (f" Pose    yaw: {yaw}°   pitch: {pitch}°   roll: {roll}°   rate: {tilt_rate} °/s   accel: {lin_accel_x} m/s²")
 
-        return [sep, row1, row2, row3, sep]
+        return [sep, row1, row2, row3, row4]
 
     def _redraw_dashboard_line(self):
         rows = self._format_dashboard()
@@ -234,6 +254,13 @@ class RobotMonitor:
                 last_command=f"PID tuned {pid_match.group(1)}/{pid_match.group(2)}/{pid_match.group(3)}",
             )
 
+        cap_match = re.search(r"Motor max step rate set:\s+([0-9.+-]+)\s+Hz", message)
+        if cap_match:
+            self._set_state(
+                max_step_hz=float(cap_match.group(1)),
+                last_command=f"cap {cap_match.group(1)} Hz",
+            )
+
     def _update_from_telemetry(self, payload):
         parts = [part.strip() for part in payload.split(",") if part.strip()]
         if len(parts) < 3:
@@ -245,6 +272,14 @@ class RobotMonitor:
             roll = float(parts[2])
             tilt_rate = float(parts[3]) if len(parts) >= 4 else None
             lin_accel_x = float(parts[4]) if len(parts) >= 5 else None
+            target_pitch = float(parts[5]) if len(parts) >= 6 else None
+            dynamic_target = float(parts[6]) if len(parts) >= 7 else None
+            control_output = float(parts[7]) if len(parts) >= 8 else None
+            max_step_hz = float(parts[8]) if len(parts) >= 9 else None
+            saturation_pct = float(parts[9]) if len(parts) >= 10 else None
+            left_step_hz = float(parts[10]) if len(parts) >= 11 else None
+            right_step_hz = float(parts[11]) if len(parts) >= 12 else None
+            is_active = bool(int(float(parts[12]))) if len(parts) >= 13 else None
         except ValueError:
             return
 
@@ -253,6 +288,22 @@ class RobotMonitor:
             update["tilt_rate_dps"] = tilt_rate
         if lin_accel_x is not None:
             update["lin_accel_x"] = lin_accel_x
+        if target_pitch is not None:
+            update["target_pitch_deg"] = target_pitch
+        if dynamic_target is not None:
+            update["dynamic_target_pitch_deg"] = dynamic_target
+        if control_output is not None:
+            update["control_output_hz"] = control_output
+        if max_step_hz is not None:
+            update["max_step_hz"] = max_step_hz
+        if saturation_pct is not None:
+            update["saturation_pct"] = saturation_pct
+        if left_step_hz is not None:
+            update["left_step_hz"] = left_step_hz
+        if right_step_hz is not None:
+            update["right_step_hz"] = right_step_hz
+        if is_active is not None:
+            update["is_active"] = is_active
         self._set_state(**update)
         self._csv_log()
 
@@ -301,7 +352,24 @@ class RobotMonitor:
         elif cmd == "stop":
             self._set_state(last_command="stop", is_active=False)
         else:
-            self._set_state(last_command=cmd)
+            update = {"last_command": cmd}
+            parts = cmd.split()
+            if len(parts) >= 5 and parts[0] == "tune" and parts[1] == "pid":
+                try:
+                    update.update(kp=float(parts[2]), ki=float(parts[3]), kd=float(parts[4]))
+                except ValueError:
+                    pass
+            elif len(parts) >= 3 and parts[0] == "set" and parts[1] in ("max_hz", "cap"):
+                try:
+                    update["max_step_hz"] = float(parts[2])
+                except ValueError:
+                    pass
+            elif len(parts) >= 3 and parts[0] == "set" and parts[1] == "target":
+                try:
+                    update["target_pitch_deg"] = float(parts[2])
+                except ValueError:
+                    pass
+            self._set_state(**update)
         return True
 
     def _dashboard_renderer(self):
@@ -422,10 +490,57 @@ class RobotMonitor:
         key = parts[0].lower()
         if key in ("tl", "tr"):
             side = "left" if key == "tl" else "right"
-            hz  = parts[1] if len(parts) > 1 else "3000"
-            ms  = parts[2] if len(parts) > 2 else "3000"
+            hz  = parts[1] if len(parts) > 1 else "500"
+            ms  = parts[2] if len(parts) > 2 else "1000"
             return f"motor_test {side} {hz} {ms}"
+        if key in ("cap", "max", "maxhz", "max_hz") and len(parts) >= 2:
+            return f"set max_hz {parts[1]}"
+        if key in ("target", "tgt") and len(parts) >= 2:
+            return f"set target {parts[1]}"
+        if key == "pid" and len(parts) >= 4:
+            return f"tune pid {parts[1]} {parts[2]} {parts[3]}"
+        if key in ("kp", "ki", "kd") and len(parts) >= 2:
+            return self._pid_command_with(key, parts[1], relative=False)
+        if key in ("kp+", "ki+", "kd+") and len(parts) >= 2:
+            return self._pid_command_with(key[:2], parts[1], relative=True)
+        if key in ("kp-", "ki-", "kd-") and len(parts) >= 2:
+            return self._pid_command_with(key[:2], f"-{parts[1]}", relative=True)
+        if key == "preset" and len(parts) >= 2:
+            preset = parts[1].lower()
+            presets = {
+                "soft": (250.0, 0.0, 25.0, 1000.0),
+                "base": (400.0, 0.0, 60.0, 1500.0),
+                "strong": (700.0, 0.0, 90.0, 2500.0),
+            }
+            if preset in presets:
+                kp, ki, kd, cap = presets[preset]
+                self.send_command(f"set max_hz {cap}")
+                time.sleep(0.05)
+                return f"tune pid {kp} {ki} {kd}"
         return cmd
+
+    def _pid_command_with(self, gain, value_text, relative):
+        try:
+            value = float(value_text)
+        except ValueError:
+            return value_text
+
+        with self.state_lock:
+            kp = self.kp
+            ki = self.ki
+            kd = self.kd
+
+        if gain == "kp":
+            kp = kp + value if relative else value
+        elif gain == "ki":
+            ki = ki + value if relative else value
+        elif gain == "kd":
+            kd = kd + value if relative else value
+
+        kp = max(0.0, kp)
+        ki = max(0.0, ki)
+        kd = max(0.0, kd)
+        return f"tune pid {kp:.6g} {ki:.6g} {kd:.6g}"
 
     def print_help(self):
         with self.print_lock:
@@ -435,15 +550,23 @@ Available commands:
   start                         Arm balance control
   stop                          Disable motors (emergency stop)
   tune pid <kp> <ki> <kd>       Update PID gains live
+  pid <kp> <ki> <kd>            Shortcut for tune pid
+  kp|ki|kd <value>              Set one PID gain, preserving the other two
+  kp+|ki+|kd+ <delta>           Increase one gain
+  kp-|ki-|kd- <delta>           Decrease one gain
   set target <deg>              Set balance point pitch angle
+  target <deg>                  Shortcut for set target
+  set max_hz <hz>               Set motor speed cap; firmware clamps hard limits
+  cap <hz>                      Shortcut for set max_hz
+  preset soft|base|strong       Send a starting PID/cap combination
   calibrate                     Capture current pitch as balance target
   forward <0-100>               Drive forward at speed %
   backward <0-100>              Drive backward at speed %
   left <0-100>                  Turn left at speed %
   right <0-100>                 Turn right at speed %
   motor_test left|right|both <hz> [ms]   Spin motor(s) for a timed burst
-  tl [hz] [ms]                  Shortcut: test left motor  (default 3000 Hz, 3000 ms)
-  tr [hz] [ms]                  Shortcut: test right motor (default 3000 Hz, 3000 ms)
+  tl [hz] [ms]                  Shortcut: test left motor  (default 500 Hz, 1000 ms)
+  tr [hz] [ms]                  Shortcut: test right motor (default 500 Hz, 1000 ms)
   watchdog_clear                Clear watchdog trip latch
   help                          Show this message
   quit                          Exit monitor

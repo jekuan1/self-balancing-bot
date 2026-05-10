@@ -14,6 +14,7 @@
 bool robot_control_send_stop(void);
 bool robot_control_send_start(void);
 bool robot_control_send_motor_test(const motor_test_params_t *params);
+bool robot_control_set_max_step_hz(float max_step_hz);
 
 static const char *TAG = "udp_cmd_receiver";
 
@@ -195,6 +196,11 @@ static void udp_command_task(void *pvParameters)
                             float pitch = 0.0f;
                             if (parse_float_arg(argv[2], &pitch)) {
                                 robot_control_set_target(pitch);
+                            }
+                        } else if (argc >= 3 && (strcmp(argv[1], "max_hz") == 0 || strcmp(argv[1], "cap") == 0)) {
+                            float max_hz = 0.0f;
+                            if (parse_float_arg(argv[2], &max_hz)) {
+                                robot_control_set_max_step_hz(max_hz);
                             }
                         }
                     } else if (strcmp(argv[0], "calibrate") == 0) {

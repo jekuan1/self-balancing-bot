@@ -176,7 +176,7 @@ static void handle_right(int argc, char **argv)
 static void handle_set_target(int argc, char **argv)
 {
     if (argc < 3 || strcmp(argv[1], "target") != 0) {
-        ESP_LOGW(TAG, "Usage: set target <pitch_deg>");
+        ESP_LOGW(TAG, "Usage: set target <pitch_deg> OR set max_hz <hz>");
         return;
     }
     float pitch = 0.0f;
@@ -185,6 +185,26 @@ static void handle_set_target(int argc, char **argv)
         return;
     }
     robot_control_set_target(pitch);
+}
+
+static void handle_set(int argc, char **argv)
+{
+    if (argc >= 3 && strcmp(argv[1], "target") == 0) {
+        handle_set_target(argc, argv);
+        return;
+    }
+
+    if (argc >= 3 && (strcmp(argv[1], "max_hz") == 0 || strcmp(argv[1], "cap") == 0)) {
+        float max_hz = 0.0f;
+        if (!parse_float_arg(argv[2], &max_hz)) {
+            ESP_LOGW(TAG, "Max step rate must be numeric");
+            return;
+        }
+        robot_control_set_max_step_hz(max_hz);
+        return;
+    }
+
+    ESP_LOGW(TAG, "Usage: set target <pitch_deg> OR set max_hz <hz>");
 }
 
 static void handle_calibrate(void)
@@ -247,6 +267,7 @@ static void handle_help(void)
     ESP_LOGI(TAG, "  stop                     - Stop balance control");
     ESP_LOGI(TAG, "  tune pid <kp> <ki> <kd>  - Update PID gains live");
     ESP_LOGI(TAG, "  set target <pitch_deg>   - Set balance target pitch angle");
+    ESP_LOGI(TAG, "  set max_hz <hz>          - Set motor command cap (firmware clamps to safe range)");
     ESP_LOGI(TAG, "  calibrate                - Set target to current pitch reading");
     ESP_LOGI(TAG, "  forward <0-100>          - Drive forward at speed");
     ESP_LOGI(TAG, "  backward <0-100>         - Drive backward at speed");
@@ -339,7 +360,7 @@ bool command_parser_poll(command_parser_t *parser, control_setpoint_t *setpoint)
     } else if (strcmp(argv[0], "right") == 0) {
         handle_right(argc, argv);
     } else if (strcmp(argv[0], "set") == 0) {
-        handle_set_target(argc, argv);
+        handle_set(argc, argv);
     } else if (strcmp(argv[0], "calibrate") == 0) {
         handle_calibrate();
     } else if (strcmp(argv[0], "motor_test") == 0) {

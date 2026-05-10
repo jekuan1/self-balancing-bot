@@ -31,7 +31,16 @@ void telemetry_comms_init(telemetry_comms_t *telemetry)
     s_dest_addr.sin_port = htons(1234); // Port 1234
 }
 
-void telemetry_comms_publish(telemetry_comms_t *telemetry, robot_state_t state, const robot_pose_t *pose)
+void telemetry_comms_publish(telemetry_comms_t *telemetry,
+                             robot_state_t state,
+                             const robot_pose_t *pose,
+                             float target_pitch_deg,
+                             float dynamic_target_pitch_deg,
+                             float control_output_hz,
+                             float max_step_hz,
+                             float left_step_hz,
+                             float right_step_hz,
+                             bool control_active)
 {
     int64_t now_us = esp_timer_get_time();
     if (telemetry->last_publish_us != 0) {
@@ -47,15 +56,33 @@ void telemetry_comms_publish(telemetry_comms_t *telemetry, robot_state_t state, 
     // 1. Log to console as before
     ESP_LOGD(TAG, "Y=%.2f P=%.2f R=%.2f", pose->yaw_deg, pose->pitch_deg, pose->roll_deg);
 
-    // 2. Send over UDP as CSV: "yaw,pitch,roll,tilt_rate"
+    float saturation_pct = 0.0f;
+    if (max_step_hz > 0.0f) {
+        float abs_output = control_output_hz < 0.0f ? -control_output_hz : control_output_hz;
+        saturation_pct = (abs_output / max_step_hz) * 100.0f;
+        if (saturation_pct > 100.0f) {
+            saturation_pct = 100.0f;
+        }
+    }
+
+    // 2. Send over UDP as CSV:
+    // yaw,pitch,roll,tilt_rate,lin_accel_x,target,dynamic_target,output_hz,max_hz,saturation_pct,left_hz,right_hz,active
     if (s_udp_sock >= 0) {
-        char payload[96];
-        int len = snprintf(payload, sizeof(payload), "%.2f,%.2f,%.2f,%.2f,%.3f\n",
+        char payload[208];
+        int len = snprintf(payload, sizeof(payload), "%.2f,%.2f,%.2f,%.2f,%.3f,%.2f,%.2f,%.1f,%.1f,%.1f,%.1f,%.1f,%d\n",
                            pose->yaw_deg,
                            pose->pitch_deg,
                            pose->roll_deg,
                            pose->tilt_rate_dps,
-                           pose->lin_accel_x);
+                           pose->lin_accel_x,
+                           target_pitch_deg,
+                           dynamic_target_pitch_deg,
+                           control_output_hz,
+                           max_step_hz,
+                           saturation_pct,
+                           left_step_hz,
+                           right_step_hz,
+                           control_active ? 1 : 0);
 
         sendto(s_udp_sock, payload, len, 0, (struct sockaddr *)&s_dest_addr, sizeof(s_dest_addr));
     }

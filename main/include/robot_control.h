@@ -2,6 +2,7 @@
 #define ROBOT_CONTROL_H
 
 #include <stdbool.h>
+#include <stdint.h>
 
 typedef enum {
     ROBOT_CONTROL_CMD_NONE = 0,
@@ -22,6 +23,8 @@ bool robot_control_send_start(void);
 bool robot_control_send_motor_test(const motor_test_params_t *params);
 bool robot_control_tune_pid(float kp, float ki, float kd);
 bool robot_control_set_target(float pitch_deg);
+bool robot_control_set_max_step_hz(float max_step_hz);
 float robot_control_get_pitch(void);
+float robot_control_get_max_step_hz(void);
 
 #endif
