@@ -36,6 +36,7 @@ void telemetry_comms_publish(telemetry_comms_t *telemetry,
                              const robot_pose_t *pose,
                              float target_pitch_deg,
                              float dynamic_target_pitch_deg,
+                             float velocity_gain,
                              float control_output_hz,
                              float max_step_hz,
                              float left_step_hz,
@@ -66,10 +67,10 @@ void telemetry_comms_publish(telemetry_comms_t *telemetry,
     }
 
     // 2. Send over UDP as CSV:
-    // yaw,pitch,roll,tilt_rate,lin_accel_x,target,dynamic_target,output_hz,max_hz,saturation_pct,left_hz,right_hz,active
+    // yaw,pitch,roll,tilt_rate,lin_accel_x,target,dynamic_target,k_vel_p,output_hz,max_hz,saturation_pct,left_hz,right_hz,active
     if (s_udp_sock >= 0) {
         char payload[208];
-        int len = snprintf(payload, sizeof(payload), "%.2f,%.2f,%.2f,%.2f,%.3f,%.2f,%.2f,%.1f,%.1f,%.1f,%.1f,%.1f,%d\n",
+        int len = snprintf(payload, sizeof(payload), "%.2f,%.2f,%.2f,%.2f,%.3f,%.2f,%.2f,%.3f,%.1f,%.1f,%.1f,%.1f,%.1f,%d\n",
                            pose->yaw_deg,
                            pose->pitch_deg,
                            pose->roll_deg,
@@ -77,6 +78,7 @@ void telemetry_comms_publish(telemetry_comms_t *telemetry,
                            pose->lin_accel_x,
                            target_pitch_deg,
                            dynamic_target_pitch_deg,
+                           velocity_gain,
                            control_output_hz,
                            max_step_hz,
                            saturation_pct,

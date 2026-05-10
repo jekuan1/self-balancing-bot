@@ -15,6 +15,7 @@ bool robot_control_send_stop(void);
 bool robot_control_send_start(void);
 bool robot_control_send_motor_test(const motor_test_params_t *params);
 bool robot_control_set_max_step_hz(float max_step_hz);
+bool robot_control_set_velocity_gain(float k_vel_p);
 
 static const char *TAG = "udp_cmd_receiver";
 
@@ -127,6 +128,16 @@ static void udp_command_task(void *pvParameters)
                             ESP_LOGI(TAG, "tune pid -> kp=%.3f ki=%.3f kd=%.3f", kp, ki, kd);
                         } else {
                             ESP_LOGW(TAG, "Usage: tune pid <kp> <ki> <kd>");
+                        }
+                    } else if (strcmp(argv[0], "tune") == 0 && argc >= 3 &&
+                               (strcmp(argv[1], "vel") == 0 ||
+                                strcmp(argv[1], "kvel") == 0 ||
+                                strcmp(argv[1], "velocity") == 0)) {
+                        float k_vel_p = 0.0f;
+                        if (parse_float_arg(argv[2], &k_vel_p)) {
+                            robot_control_set_velocity_gain(k_vel_p);
+                        } else {
+                            ESP_LOGW(TAG, "Usage: tune vel <k_vel_p>");
                         }
                     } else if (strcmp(argv[0], "forward") == 0) {
                         if (argc >= 2) {

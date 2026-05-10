@@ -48,6 +48,7 @@ Useful tuning commands:
 
 - `pid <kp> <ki> <kd>` updates all PID gains.
 - `kp <value>`, `kd <value>`, `kp+ <delta>`, and `kd- <delta>` adjust one gain at a time.
+- `kvel <value>`, `kvel+ <delta>`, and `kvel- <delta>` tune the velocity-to-pitch dynamic-target gain.
 - `cap <hz>` changes the motor step-rate cap live. Firmware clamps this into its allowed range.
 - `preset soft`, `preset base`, and `preset strong` send quick starting combinations.
 - `target <deg>` changes the balance pitch target.

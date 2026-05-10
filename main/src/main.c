@@ -29,6 +29,7 @@ static const char *TAG = "motor_test";
 #define DEFAULT_MAX_STEP_HZ 1500.0f
 #define HARD_MAX_STEP_HZ 5000.0f
 #define MIN_MAX_STEP_HZ 100.0f
+#define DEFAULT_VELOCITY_GAIN 1.5f
 
 typedef struct {
     imu_module_t imu;
@@ -43,6 +44,7 @@ typedef struct {
     robot_pose_t current_pose;
     float target_pitch_deg;
     float dynamic_target_pitch_deg;
+    float velocity_gain;
     float control_output_hz;
     bool control_active;
 } robot_runtime_t;
@@ -115,6 +117,20 @@ bool robot_control_set_target(float pitch_deg)
     g_runtime.target_pitch_deg = pitch_deg;
     pid_controller_reset(&g_runtime.balance_pid);
     ESP_LOGI(TAG, "Target pitch set: %.3f deg", pitch_deg);
+    return true;
+}
+
+bool robot_control_set_velocity_gain(float k_vel_p)
+{
+    if (k_vel_p < -20.0f) {
+        k_vel_p = -20.0f;
+    }
+    if (k_vel_p > 20.0f) {
+        k_vel_p = 20.0f;
+    }
+
+    g_runtime.velocity_gain = k_vel_p;
+    ESP_LOGI(TAG, "Velocity gain set: k_vel_p=%.3f", (double)k_vel_p);
     return true;
 }
 
@@ -194,9 +210,8 @@ static void control_task_fn(void *arg)
     bool stopped = true;
 
     // Outer velocity loop: integrates lin_accel_x to estimate forward velocity,
-    // then nudges target_pitch to cancel drift. K_VEL_P converts m/s to degrees
-    // of pitch offset. VEL_DECAY bleeds the integrator to prevent bias accumulation.
-    const float K_VEL_P  = 1.5f;   // deg per (m/s) — tune this
+    // then nudges target_pitch to cancel drift. velocity_gain converts m/s to
+    // degrees of pitch offset. VEL_DECAY bleeds the integrator to reduce bias.
     const float VEL_DECAY = 0.98f;  // per sample (~100Hz)
     float velocity_ms = 0.0f;
     int64_t last_sample_us = 0;
@@ -283,7 +298,7 @@ static void control_task_fn(void *arg)
                 last_sample_us = sample.timestamp_us;
 
                 // 2. Outer P loop: nudge target pitch to cancel accumulated velocity
-                float dynamic_target = runtime->target_pitch_deg + K_VEL_P * velocity_ms;
+                float dynamic_target = runtime->target_pitch_deg + runtime->velocity_gain * velocity_ms;
                 runtime->dynamic_target_pitch_deg = dynamic_target;
 
                 // 3. Get current pitch
@@ -357,6 +372,7 @@ static void supervisor_task_fn(void *arg)
                                 &runtime->current_pose,
                                 runtime->target_pitch_deg,
                                 runtime->dynamic_target_pitch_deg,
+                                runtime->velocity_gain,
                                 runtime->control_output_hz,
                                 runtime->motor_hal.max_step_hz,
                                 runtime->motor_hal.left.target_hz,
@@ -489,6 +505,8 @@ void app_main(void)
                         -g_runtime.motor_hal.max_step_hz,
                         g_runtime.motor_hal.max_step_hz);
     g_runtime.target_pitch_deg = 0.0f; // Stand perfectly upright
+    g_runtime.dynamic_target_pitch_deg = g_runtime.target_pitch_deg;
+    g_runtime.velocity_gain = DEFAULT_VELOCITY_GAIN;
 
     command_parser_init(&g_runtime.command_parser);
 

@@ -45,6 +45,7 @@ class RobotMonitor:
         self.kd = 5.0 # 5 good default
         self.target_pitch_deg = 0.0
         self.dynamic_target_pitch_deg = 0.0
+        self.velocity_gain = 1.5
         self.control_output_hz = 0.0
         self.max_step_hz = 1500.0
         self.saturation_pct = 0.0
@@ -89,7 +90,7 @@ class RobotMonitor:
             "left_temp_c", "right_temp_c", "left_sg", "right_sg",
             "left_cs", "right_cs",
             "kp", "ki", "kd", "target_pitch_deg", "dynamic_target_pitch_deg",
-            "control_output_hz", "max_step_hz", "saturation_pct",
+            "velocity_gain", "control_output_hz", "max_step_hz", "saturation_pct",
             "left_step_hz", "right_step_hz", "is_active",
         ])
         print(f"[CSV] Logging to {path}")
@@ -107,7 +108,7 @@ class RobotMonitor:
                     self.left_temp_c, self.right_temp_c, self.left_sg, self.right_sg,
                     self.left_cs, self.right_cs,
                     self.kp, self.ki, self.kd, self.target_pitch_deg,
-                    self.dynamic_target_pitch_deg, self.control_output_hz,
+                    self.dynamic_target_pitch_deg, self.velocity_gain, self.control_output_hz,
                     self.max_step_hz, self.saturation_pct,
                     self.left_step_hz, self.right_step_hz,
                     1 if self.is_active else 0,
@@ -146,6 +147,7 @@ class RobotMonitor:
             kd           = self._format_float(self.kd, precision=2)
             target_pitch = self._format_float(self.target_pitch_deg, precision=2)
             dynamic_target = self._format_float(self.dynamic_target_pitch_deg, precision=2)
+            velocity_gain = self._format_float(self.velocity_gain, precision=3)
             output_hz    = self._format_float(self.control_output_hz, precision=0)
             max_hz       = self._format_float(self.max_step_hz, precision=0)
             sat_pct      = self._format_float(self.saturation_pct, precision=0)
@@ -167,7 +169,7 @@ class RobotMonitor:
                 f"   │   CS   L: {left_cs}   R: {right_cs}"
                 f"   │   SG   L: {left_sg}   R: {right_sg}"
                 f"   │   {status}   {now}")
-        row2 = (f" PID     kp: {kp}   ki: {ki}   kd: {kd}   target: {target_pitch}°   dyn: {dynamic_target}°")
+        row2 = (f" PID     kp: {kp}   ki: {ki}   kd: {kd}   kvel: {velocity_gain}   target: {target_pitch}°   dyn: {dynamic_target}°")
         row3 = (f" Motor   out: {output_hz} Hz   L: {left_hz} Hz   R: {right_hz} Hz   cap: {max_hz} Hz   sat: {sat_pct}%")
         row4 = (f" Pose    yaw: {yaw}°   pitch: {pitch}°   roll: {roll}°   rate: {tilt_rate} °/s   accel: {lin_accel_x} m/s²")
 
@@ -261,6 +263,13 @@ class RobotMonitor:
                 last_command=f"cap {cap_match.group(1)} Hz",
             )
 
+        vel_gain_match = re.search(r"Velocity gain set:\s+k_vel_p=([0-9.+-]+)", message)
+        if vel_gain_match:
+            self._set_state(
+                velocity_gain=float(vel_gain_match.group(1)),
+                last_command=f"kvel {vel_gain_match.group(1)}",
+            )
+
     def _update_from_telemetry(self, payload):
         parts = [part.strip() for part in payload.split(",") if part.strip()]
         if len(parts) < 3:
@@ -274,12 +283,22 @@ class RobotMonitor:
             lin_accel_x = float(parts[4]) if len(parts) >= 5 else None
             target_pitch = float(parts[5]) if len(parts) >= 6 else None
             dynamic_target = float(parts[6]) if len(parts) >= 7 else None
-            control_output = float(parts[7]) if len(parts) >= 8 else None
-            max_step_hz = float(parts[8]) if len(parts) >= 9 else None
-            saturation_pct = float(parts[9]) if len(parts) >= 10 else None
-            left_step_hz = float(parts[10]) if len(parts) >= 11 else None
-            right_step_hz = float(parts[11]) if len(parts) >= 12 else None
-            is_active = bool(int(float(parts[12]))) if len(parts) >= 13 else None
+            if len(parts) >= 14:
+                velocity_gain = float(parts[7])
+                control_output = float(parts[8])
+                max_step_hz = float(parts[9])
+                saturation_pct = float(parts[10])
+                left_step_hz = float(parts[11])
+                right_step_hz = float(parts[12])
+                is_active = bool(int(float(parts[13])))
+            else:
+                velocity_gain = None
+                control_output = float(parts[7]) if len(parts) >= 8 else None
+                max_step_hz = float(parts[8]) if len(parts) >= 9 else None
+                saturation_pct = float(parts[9]) if len(parts) >= 10 else None
+                left_step_hz = float(parts[10]) if len(parts) >= 11 else None
+                right_step_hz = float(parts[11]) if len(parts) >= 12 else None
+                is_active = bool(int(float(parts[12]))) if len(parts) >= 13 else None
         except ValueError:
             return
 
@@ -292,6 +311,8 @@ class RobotMonitor:
             update["target_pitch_deg"] = target_pitch
         if dynamic_target is not None:
             update["dynamic_target_pitch_deg"] = dynamic_target
+        if velocity_gain is not None:
+            update["velocity_gain"] = velocity_gain
         if control_output is not None:
             update["control_output_hz"] = control_output
         if max_step_hz is not None:
@@ -357,6 +378,11 @@ class RobotMonitor:
             if len(parts) >= 5 and parts[0] == "tune" and parts[1] == "pid":
                 try:
                     update.update(kp=float(parts[2]), ki=float(parts[3]), kd=float(parts[4]))
+                except ValueError:
+                    pass
+            elif len(parts) >= 3 and parts[0] == "tune" and parts[1] in ("vel", "kvel", "velocity"):
+                try:
+                    update["velocity_gain"] = float(parts[2])
                 except ValueError:
                     pass
             elif len(parts) >= 3 and parts[0] == "set" and parts[1] in ("max_hz", "cap"):
@@ -499,6 +525,12 @@ class RobotMonitor:
             return f"set target {parts[1]}"
         if key == "pid" and len(parts) >= 4:
             return f"tune pid {parts[1]} {parts[2]} {parts[3]}"
+        if key in ("kvel", "vel", "velocity_gain") and len(parts) >= 2:
+            return f"tune vel {parts[1]}"
+        if key in ("kvel+", "vel+") and len(parts) >= 2:
+            return self._velocity_gain_command_with(parts[1], relative=True)
+        if key in ("kvel-", "vel-") and len(parts) >= 2:
+            return self._velocity_gain_command_with(f"-{parts[1]}", relative=True)
         if key in ("kp", "ki", "kd") and len(parts) >= 2:
             return self._pid_command_with(key, parts[1], relative=False)
         if key in ("kp+", "ki+", "kd+") and len(parts) >= 2:
@@ -542,6 +574,18 @@ class RobotMonitor:
         kd = max(0.0, kd)
         return f"tune pid {kp:.6g} {ki:.6g} {kd:.6g}"
 
+    def _velocity_gain_command_with(self, value_text, relative):
+        try:
+            value = float(value_text)
+        except ValueError:
+            return value_text
+
+        with self.state_lock:
+            velocity_gain = self.velocity_gain
+
+        velocity_gain = velocity_gain + value if relative else value
+        return f"tune vel {velocity_gain:.6g}"
+
     def print_help(self):
         with self.print_lock:
             print(
@@ -551,6 +595,9 @@ Available commands:
   stop                          Disable motors (emergency stop)
   tune pid <kp> <ki> <kd>       Update PID gains live
   pid <kp> <ki> <kd>            Shortcut for tune pid
+  tune vel <k_vel_p>            Update velocity-to-pitch gain live
+  kvel <value>                  Shortcut for tune vel
+  kvel+|kvel- <delta>           Adjust velocity gain
   kp|ki|kd <value>              Set one PID gain, preserving the other two
   kp+|ki+|kd+ <delta>           Increase one gain
   kp-|ki-|kd- <delta>           Decrease one gain

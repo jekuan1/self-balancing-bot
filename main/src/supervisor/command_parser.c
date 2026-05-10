@@ -87,8 +87,20 @@ static bool parse_float_arg(const char *text, float *value)
 
 static void handle_tune_pid(int argc, char **argv)
 {
+    if (argc >= 3 && (strcmp(argv[1], "vel") == 0 ||
+                      strcmp(argv[1], "kvel") == 0 ||
+                      strcmp(argv[1], "velocity") == 0)) {
+        float k_vel_p = 0.0f;
+        if (!parse_float_arg(argv[2], &k_vel_p)) {
+            ESP_LOGW(TAG, "Velocity gain must be numeric");
+            return;
+        }
+        robot_control_set_velocity_gain(k_vel_p);
+        return;
+    }
+
     if (argc < 5 || strcmp(argv[1], "pid") != 0) {
-        ESP_LOGW(TAG, "Usage: tune pid <kp> <ki> <kd>");
+        ESP_LOGW(TAG, "Usage: tune pid <kp> <ki> <kd> OR tune vel <k_vel_p>");
         return;
     }
 
@@ -266,6 +278,7 @@ static void handle_help(void)
     ESP_LOGI(TAG, "  start                    - Start balance control");
     ESP_LOGI(TAG, "  stop                     - Stop balance control");
     ESP_LOGI(TAG, "  tune pid <kp> <ki> <kd>  - Update PID gains live");
+    ESP_LOGI(TAG, "  tune vel <k_vel_p>       - Update velocity-to-pitch gain live");
     ESP_LOGI(TAG, "  set target <pitch_deg>   - Set balance target pitch angle");
     ESP_LOGI(TAG, "  set max_hz <hz>          - Set motor command cap (firmware clamps to safe range)");
     ESP_LOGI(TAG, "  calibrate                - Set target to current pitch reading");
