@@ -15,8 +15,8 @@ void state_estimator_update(state_estimator_t *estimator, const imu_sample_t *sa
     out_pose->tilt_deg = sample->pitch_deg;
     out_pose->timestamp_us = sample->timestamp_us;
     
-    // Direct usage of gyro for tilt rate - much cleaner than differentiation
     out_pose->tilt_rate_dps = sample->gyro_pitch_dps;
+    out_pose->lin_accel_x = sample->lin_accel_x;
 
     estimator->last_tilt_deg = sample->pitch_deg;
     estimator->last_ts_us = sample->timestamp_us;

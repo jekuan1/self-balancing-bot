@@ -1,36 +1,223 @@
 #include "driver/gpio.h"
-#include "driver/i2c_master.h"
+#include "driver/spi_common.h"
 #include "driver/spi_master.h"
 #include "esp_err.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/queue.h"
+#include "nvs_flash.h"
+#include "control/pid_controller.h"
 #include "hal/imu_module.h"
 #include "hal/motor_module.h"
+#include "hal/ota_module.h"
+#include "hal/safety_watchdog.h"
+#include "hal/wifi_module.h"
+#include "robot_control.h"
+#include "robot_types.h"
+#include "control/state_estimator.h"
+#include "supervisor/command_parser.h"
+#include "supervisor/udp_command_receiver.h"
+#include "supervisor/udp_logging.h"
+#include "supervisor/telemetry_comms.h"
 
 static const char *TAG = "motor_test";
+
+#define ENABLE_OTA_AP 1
+#define OTA_AP_SSID "BalanceBot"
+#define OTA_AP_PASSWORD "balance123"
+#define DEFAULT_MAX_STEP_HZ 1500.0f
+#define HARD_MAX_STEP_HZ 5000.0f
+#define MIN_MAX_STEP_HZ 100.0f
+#define DEFAULT_PID_KP 600.0f
+#define DEFAULT_PID_KI 0.0f
+#define DEFAULT_PID_KD 20.0f
+#define DEFAULT_VELOCITY_GAIN 10.0f
+#define BALANCE_PERIOD_US 10000
+#define IMU_TIMEOUT_SAMPLES 5
 
 typedef struct {
     imu_module_t imu;
     motor_module_t motor_hal;
+    safety_watchdog_t safety_watchdog;
     motor_command_t test_cmd;
-    int64_t motion_start_us;
-    TaskHandle_t control_task;
-    TaskHandle_t supervisor_task;
+    QueueHandle_t control_cmd_queue;
+    command_parser_t command_parser;
+    pid_controller_t balance_pid;
+    state_estimator_t state_estimator;
+    telemetry_comms_t telemetry_comms;
+    TaskHandle_t control_task_handle;
+    esp_timer_handle_t balance_timer_handle;
+    robot_pose_t current_pose;
+    float target_pitch_deg;
+    float dynamic_target_pitch_deg;
+    float velocity_gain;
+    float control_output_hz;
+    bool control_active;
 } robot_runtime_t;
 
 static robot_runtime_t g_runtime = {0};
+static volatile motor_test_params_t g_motor_test_params = {0};
+static volatile bool g_estop_requested = false;
+static volatile bool g_balance_tick_requested = false;
+static volatile bool g_imu_timeout_latched = false;
+
+static void notify_control_task(void)
+{
+    if (g_runtime.control_task_handle != NULL) {
+        xTaskNotifyGive(g_runtime.control_task_handle);
+    }
+}
+
+static void balance_timer_callback(void *arg)
+{
+    (void)arg;
+    g_balance_tick_requested = true;
+    notify_control_task();
+}
+
+bool robot_control_send_command(robot_control_command_t command)
+{
+    if (command == ROBOT_CONTROL_CMD_STOP) {
+        g_estop_requested = true;
+        notify_control_task();
+    }
+
+    if (g_runtime.control_cmd_queue == NULL) {
+        return false;
+    }
+
+    bool ok = xQueueOverwrite(g_runtime.control_cmd_queue, &command) == pdTRUE;
+    notify_control_task();
+    return ok;
+}
+
+bool robot_control_send_stop(void)
+{
+    return robot_control_send_command(ROBOT_CONTROL_CMD_STOP);
+}
+
+bool robot_control_send_start(void)
+{
+    g_estop_requested = false;
+    g_imu_timeout_latched = false;
+    return robot_control_send_command(ROBOT_CONTROL_CMD_START);
+}
+
+bool robot_control_send_motor_test(const motor_test_params_t *params)
+{
+    if (params == NULL) return false;
+    g_motor_test_params.left_hz      = params->left_hz;
+    g_motor_test_params.right_hz     = params->right_hz;
+    g_motor_test_params.duration_ms  = params->duration_ms;
+    return robot_control_send_command(ROBOT_CONTROL_CMD_MOTOR_TEST);
+}
+
+bool robot_control_tune_pid(float kp, float ki, float kd)
+{
+    g_runtime.balance_pid.kp = kp;
+    g_runtime.balance_pid.ki = ki;
+    g_runtime.balance_pid.kd = kd;
+    pid_controller_reset(&g_runtime.balance_pid);
+    ESP_LOGI(TAG, "PID tuned: kp=%.3f ki=%.3f kd=%.3f", kp, ki, kd);
+    return true;
+}
+
+bool robot_control_set_max_step_hz(float max_step_hz)
+{
+    if (max_step_hz < MIN_MAX_STEP_HZ) {
+        max_step_hz = MIN_MAX_STEP_HZ;
+    }
+    if (max_step_hz > HARD_MAX_STEP_HZ) {
+        max_step_hz = HARD_MAX_STEP_HZ;
+    }
+
+    g_runtime.motor_hal.max_step_hz = max_step_hz;
+    g_runtime.balance_pid.out_min = -max_step_hz;
+    g_runtime.balance_pid.out_max = max_step_hz;
+
+    g_runtime.test_cmd.left_step_hz = g_runtime.motor_hal.left.target_hz;
+    g_runtime.test_cmd.right_step_hz = g_runtime.motor_hal.right.target_hz;
+    motor_module_apply_command(&g_runtime.motor_hal, &g_runtime.test_cmd);
+    pid_controller_reset(&g_runtime.balance_pid);
+
+    ESP_LOGI(TAG, "Motor max step rate set: %.1f Hz (allowed %.1f-%.1f Hz)",
+             (double)max_step_hz, (double)MIN_MAX_STEP_HZ, (double)HARD_MAX_STEP_HZ);
+    return true;
+}
+
+bool robot_control_set_target(float pitch_deg)
+{
+    g_runtime.target_pitch_deg = pitch_deg;
+    pid_controller_reset(&g_runtime.balance_pid);
+    ESP_LOGI(TAG, "Target pitch set: %.3f deg", pitch_deg);
+    return true;
+}
+
+bool robot_control_set_velocity_gain(float k_vel_p)
+{
+    if (k_vel_p < -20.0f) {
+        k_vel_p = -20.0f;
+    }
+    if (k_vel_p > 20.0f) {
+        k_vel_p = 20.0f;
+    }
+
+    g_runtime.velocity_gain = k_vel_p;
+    ESP_LOGI(TAG, "Velocity gain set: k_vel_p=%.3f", (double)k_vel_p);
+    return true;
+}
+
+float robot_control_get_pitch(void)
+{
+    return g_runtime.current_pose.pitch_deg;
+}
+
+float robot_control_get_max_step_hz(void)
+{
+    return g_runtime.motor_hal.max_step_hz;
+}
+
+static void maybe_start_ota_services(void)
+{
+#if ENABLE_OTA_AP
+    // Initialize NVS first (required by WiFi)
+    esp_err_t nvs_err = nvs_flash_init();
+    if (nvs_err == ESP_ERR_NVS_NO_FREE_PAGES || nvs_err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        ESP_LOGW(TAG, "NVS partition was truncated/updated, erasing...");
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        nvs_err = nvs_flash_init();
+    }
+    ESP_ERROR_CHECK(nvs_err);
+
+    esp_err_t wifi_err = wifi_module_init_ap(OTA_AP_SSID, OTA_AP_PASSWORD);
+    if (wifi_err != ESP_OK) {
+        ESP_LOGE(TAG, "WiFi AP init failed: %s", esp_err_to_name(wifi_err));
+        return;
+    }
+
+    esp_err_t ota_err = ota_module_init();
+    if (ota_err != ESP_OK) {
+        ESP_LOGE(TAG, "OTA server init failed: %s", esp_err_to_name(ota_err));
+        return;
+    }
+    ESP_LOGI(TAG, "OTA AP mode enabled. SSID=%s, open http://192.168.4.1/", OTA_AP_SSID);
+    
+    // Start UDP telemetry; command receiver is started later after control state is ready.
+    udp_logging_init("192.168.4.255", 5556);
+    ESP_LOGI(TAG, "UDP telemetry enabled on port 5556");
+#endif
+}
 
 // TMC2240 SPI test wiring (adjust to your board).
-#define TMC_SPI_HOST        SPI2_HOST
+#define TMC_SPI_HOST        1
 #define TMC_SPI_SCLK        GPIO_NUM_16
 #define TMC_SPI_MOSI        GPIO_NUM_15
 #define TMC_SPI_MISO        GPIO_NUM_10
 #define TMC_EN              GPIO_NUM_18
 
 // ============== LEFT MOTOR PINS ==============
-
 #define TMC_LEFT_STEP       GPIO_NUM_8
 #define TMC_LEFT_DIR        GPIO_NUM_13
 #define TMC_LEFT_SPI_CS     GPIO_NUM_21
@@ -50,49 +237,183 @@ static void control_task_fn(void *arg)
         return;
     }
 
-    int64_t start_time = esp_timer_get_time();
-    runtime->motion_start_us = start_time;
+    motor_module_set_enabled(&runtime->motor_hal, false);
+    ESP_LOGI(TAG, "Control Task Started in STOP mode. Waiting for START command...");
 
-    motor_module_set_enabled(&runtime->motor_hal, true);
-    ESP_LOGI(TAG, "AT#1: holding standstill for StealthChop2 tuning before first move...");
-    vTaskDelay(pdMS_TO_TICKS(150));
+    // Pitch polarity can be flipped if IMU mounting orientation is inverted.
+    const float PITCH_POLARITY = -1.0f;
+    bool stopped = true;
 
-    runtime->motion_start_us = esp_timer_get_time();
-    
-    // Phase 1: Left motor only for 3 seconds
-    ESP_LOGI(TAG, "Phase 1: Running LEFT motor for 3 seconds...");
-    runtime->test_cmd.left_step_hz = 1000.0f;
-    runtime->test_cmd.right_step_hz = 0.0f;
-    motor_module_apply_command(&runtime->motor_hal, &runtime->test_cmd);
+    // Outer velocity loop: integrates lin_accel_x to estimate forward velocity,
+    // then nudges target_pitch to cancel drift. velocity_gain converts m/s to
+    // degrees of pitch offset. VEL_DECAY bleeds the integrator to reduce bias.
+    const float VEL_DECAY = 0.98f;  // per sample (~100Hz)
+    float velocity_ms = 0.0f;
+    int64_t last_sample_us = 0;
+    uint32_t missed_imu_samples = 0;
 
-    TickType_t last_wake = xTaskGetTickCount();
-    int phase = 1;
-    
     while (1) {
-        int64_t now_us = esp_timer_get_time();
-        int64_t elapsed_us = now_us - runtime->motion_start_us;
+        (void)ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
 
-        if (phase == 1 && elapsed_us >= 3000000) {
-            // Switch to Phase 2: Right motor only for 3 seconds
-            ESP_LOGI(TAG, "Phase 1 complete. Phase 2: Running RIGHT motor for 3 seconds...");
-            runtime->test_cmd.left_step_hz = 0.0f;
-            runtime->test_cmd.right_step_hz = 1000.0f;
-            motor_module_apply_command(&runtime->motor_hal, &runtime->test_cmd);
-            phase = 2;
-            runtime->motion_start_us = now_us;
-        }
-
-        if (phase == 2 && (now_us - runtime->motion_start_us) >= 3000000) {
-            // Stop both motors
-            ESP_LOGI(TAG, "Phase 2 complete. Stopping both motors.");
+        if (g_estop_requested) {
             runtime->test_cmd.left_step_hz = 0.0f;
             runtime->test_cmd.right_step_hz = 0.0f;
             motor_module_apply_command(&runtime->motor_hal, &runtime->test_cmd);
-            phase = 3;
-            ESP_LOGI(TAG, "Test Complete: Right 3s + Left 3s done. Motors stopped.");
+            motor_module_set_enabled(&runtime->motor_hal, false);
+            pid_controller_reset(&runtime->balance_pid);
+            velocity_ms = 0.0f;
+            last_sample_us = 0;
+            missed_imu_samples = 0;
+            runtime->control_output_hz = 0.0f;
+            runtime->dynamic_target_pitch_deg = runtime->target_pitch_deg;
+            runtime->control_active = false;
+            stopped = true;
+            g_estop_requested = false;
+            ESP_LOGW(TAG, "E-STOP event: motors disabled");
         }
 
-        vTaskDelayUntil(&last_wake, pdMS_TO_TICKS(10));
+        robot_control_command_t command = ROBOT_CONTROL_CMD_NONE;
+        if (runtime->control_cmd_queue != NULL && xQueueReceive(runtime->control_cmd_queue, &command, 0) == pdTRUE) {
+            if (command == ROBOT_CONTROL_CMD_STOP) {
+                runtime->test_cmd.left_step_hz = 0.0f;
+                runtime->test_cmd.right_step_hz = 0.0f;
+                motor_module_apply_command(&runtime->motor_hal, &runtime->test_cmd);
+                motor_module_set_enabled(&runtime->motor_hal, false);
+                pid_controller_reset(&runtime->balance_pid);
+                velocity_ms = 0.0f;
+                last_sample_us = 0;
+                missed_imu_samples = 0;
+                runtime->control_output_hz = 0.0f;
+                runtime->dynamic_target_pitch_deg = runtime->target_pitch_deg;
+                runtime->control_active = false;
+                stopped = true;
+                ESP_LOGW(TAG, "STOP command received: motors disabled");
+            } else if (command == ROBOT_CONTROL_CMD_START) {
+                g_estop_requested = false;
+                g_imu_timeout_latched = false;
+                motor_module_set_enabled(&runtime->motor_hal, true);
+                pid_controller_reset(&runtime->balance_pid);
+                velocity_ms = 0.0f;
+                last_sample_us = 0;
+                missed_imu_samples = 0;
+                runtime->control_output_hz = 0.0f;
+                runtime->dynamic_target_pitch_deg = runtime->target_pitch_deg;
+                runtime->control_active = true;
+                stopped = false;
+                ESP_LOGI(TAG, "START command received: motors enabled");
+            } else if (command == ROBOT_CONTROL_CMD_MOTOR_TEST) {
+                motor_test_params_t p;
+                p.left_hz     = g_motor_test_params.left_hz;
+                p.right_hz    = g_motor_test_params.right_hz;
+                p.duration_ms = g_motor_test_params.duration_ms;
+                ESP_LOGI(TAG, "MOTOR_TEST: left=%.0f Hz right=%.0f Hz duration=%lu ms",
+                         (double)p.left_hz, (double)p.right_hz, (unsigned long)p.duration_ms);
+                motor_module_set_enabled(&runtime->motor_hal, true);
+                runtime->test_cmd.left_step_hz  = p.left_hz;
+                runtime->test_cmd.right_step_hz = p.right_hz;
+                motor_module_apply_command(&runtime->motor_hal, &runtime->test_cmd);
+                TickType_t test_start = xTaskGetTickCount();
+                TickType_t test_duration = pdMS_TO_TICKS(p.duration_ms);
+                while ((xTaskGetTickCount() - test_start) < test_duration) {
+                    if (g_estop_requested) {
+                        ESP_LOGW(TAG, "MOTOR_TEST interrupted by E-STOP");
+                        break;
+                    }
+                    vTaskDelay(pdMS_TO_TICKS(10));
+                }
+                runtime->test_cmd.left_step_hz  = 0.0f;
+                runtime->test_cmd.right_step_hz = 0.0f;
+                motor_module_apply_command(&runtime->motor_hal, &runtime->test_cmd);
+                motor_module_set_enabled(&runtime->motor_hal, false);
+                runtime->control_output_hz = 0.0f;
+                velocity_ms = 0.0f;
+                last_sample_us = 0;
+                missed_imu_samples = 0;
+                runtime->control_active = false;
+                stopped = true;
+                (void)ulTaskNotifyTake(pdTRUE, 0);
+                g_balance_tick_requested = false;
+                ESP_LOGI(TAG, "MOTOR_TEST done");
+            }
+        }
+
+        if (stopped) {
+            g_balance_tick_requested = false;
+            continue;
+        }
+
+        if (!g_balance_tick_requested) {
+            continue;
+        }
+        g_balance_tick_requested = false;
+
+        if (runtime->imu.i2c_dev != NULL) {
+            // Poll IMU, update pose, run PID, and apply motor command in one
+            // high-priority cycle to avoid queue latency between sensing/control.
+            imu_module_poll_and_log(&runtime->imu);
+
+            imu_sample_t sample;
+            if (imu_module_read_sample(&runtime->imu, &sample) == ESP_OK) {
+                missed_imu_samples = 0;
+                state_estimator_update(&runtime->state_estimator, &sample, &runtime->current_pose);
+
+                // 1. Integrate linear acceleration to estimate velocity
+                if (last_sample_us != 0) {
+                    float dt = (float)(sample.timestamp_us - last_sample_us) * 1e-6f;
+                    if (dt > 0.0f && dt < 0.1f) {
+                        velocity_ms = velocity_ms * VEL_DECAY + sample.lin_accel_x * dt;
+                    }
+                }
+                last_sample_us = sample.timestamp_us;
+
+                // 2. Outer P loop: nudge target pitch to cancel accumulated velocity
+                float dynamic_target = runtime->target_pitch_deg + runtime->velocity_gain * velocity_ms;
+                runtime->dynamic_target_pitch_deg = dynamic_target;
+
+                // 3. Get current pitch
+                float current_pitch = sample.pitch_deg * PITCH_POLARITY;
+                float current_pitch_rate = runtime->current_pose.tilt_rate_dps * PITCH_POLARITY;
+
+                // 4. Inner PID controller output in step frequency (Hz)
+                float total_output = pid_controller_step(&runtime->balance_pid,
+                                                         dynamic_target,
+                                                         current_pitch,
+                                                         current_pitch_rate,
+                                                         sample.timestamp_us);
+                runtime->control_output_hz = total_output;
+
+                // 5. Map PID output to wheel commands.
+                // Left wheel follows control sign; right wheel is inverted for mirrored drivetrain orientation.
+                runtime->test_cmd.left_step_hz = total_output;
+                runtime->test_cmd.right_step_hz = -total_output;
+
+                // 6. Apply commands
+                motor_module_apply_command(&runtime->motor_hal, &runtime->test_cmd);
+            } else if (++missed_imu_samples >= IMU_TIMEOUT_SAMPLES) {
+                if (!g_imu_timeout_latched) {
+                    g_imu_timeout_latched = true;
+                    g_estop_requested = true;
+                    notify_control_task();
+                    ESP_LOGE(TAG, "IMU timeout watchdog: no valid samples for %u balance ticks",
+                             (unsigned)IMU_TIMEOUT_SAMPLES);
+                }
+                runtime->test_cmd.left_step_hz = 0.0f;
+                runtime->test_cmd.right_step_hz = 0.0f;
+                runtime->control_output_hz = 0.0f;
+                motor_module_apply_command(&runtime->motor_hal, &runtime->test_cmd);
+            }
+        } else {
+            if (!g_imu_timeout_latched) {
+                g_imu_timeout_latched = true;
+                g_estop_requested = true;
+                notify_control_task();
+                ESP_LOGE(TAG, "IMU timeout watchdog: IMU device unavailable");
+            }
+            runtime->test_cmd.left_step_hz = 0.0f;
+            runtime->test_cmd.right_step_hz = 0.0f;
+            runtime->control_output_hz = 0.0f;
+            motor_module_apply_command(&runtime->motor_hal, &runtime->test_cmd);
+        }
     }
 }
 
@@ -104,39 +425,55 @@ static void supervisor_task_fn(void *arg)
         return;
     }
 
-    int64_t last_print_us = 0;
-    int64_t last_wait_us = 0;
+    TickType_t last_wake = xTaskGetTickCount();
+    TickType_t last_log_tick = last_wake;
+    bool watchdog_latched = false;
 
     while (1) {
-        if (runtime->imu.i2c_dev != NULL) {
-            imu_module_poll_and_log(&runtime->imu);
-        }
-
-        imu_sample_t sample;
-        if (imu_module_read_sample(&runtime->imu, &sample) == ESP_OK) {
-            int64_t now_us = esp_timer_get_time();
-            if (now_us - last_print_us >= 1000000) {
-                // ESP_LOGI(TAG, "Yaw: %8.3f | Pitch: %8.3f | Roll: %8.3f",
-                //          (double)sample.yaw_deg,
-                //          (double)sample.pitch_deg,
-                //          (double)sample.roll_deg);
-                motor_module_tmc2240_test_log();
-                last_print_us = now_us;
-            }
-        } else {
-            int64_t now_us = esp_timer_get_time();
-            if (now_us - last_wait_us >= 1000000) {
-                ESP_LOGI(TAG, "Waiting for valid IMU orientation... (is the sensor connected?)");
-                last_wait_us = now_us;
+        if (safety_watchdog_is_tripped(&runtime->safety_watchdog)) {
+            if (!watchdog_latched) {
+                watchdog_latched = true;
+                (void)robot_control_send_stop();
+                ESP_LOGE(TAG,
+                         "Safety watchdog tripped (count=%lu): issuing STOP",
+                         (unsigned long)runtime->safety_watchdog.trip_count);
             }
         }
 
-        vTaskDelay(pdMS_TO_TICKS(10));
+        control_setpoint_t setpoint = {0};
+        (void)command_parser_poll(&runtime->command_parser, &setpoint);
+
+        // Keep command handling responsive while preserving high-rate telemetry.
+        TickType_t now = xTaskGetTickCount();
+        
+        // Publish telemetry at 50Hz (via telemetry_comms internal rate limiting)
+        telemetry_comms_publish(&runtime->telemetry_comms,
+                                ROBOT_STATE_READY,
+                                &runtime->current_pose,
+                                runtime->target_pitch_deg,
+                                runtime->dynamic_target_pitch_deg,
+                                runtime->velocity_gain,
+                                runtime->control_output_hz,
+                                runtime->motor_hal.max_step_hz,
+                                runtime->motor_hal.left.target_hz,
+                                runtime->motor_hal.right.target_hz,
+                                runtime->control_active);
+        
+        // Log TMC temps at 1Hz
+        if ((now - last_log_tick) >= pdMS_TO_TICKS(1000)) {
+            motor_module_tmc2240_test_log();
+            last_log_tick = now;
+        }
+
+        // Poll command parser at 20Hz.
+        vTaskDelayUntil(&last_wake, pdMS_TO_TICKS(50));
     }
 }
 
 void app_main(void)
 {
+    maybe_start_ota_services();
+
     g_runtime.imu = (imu_module_t){
         .i2c_port = I2C_NUM_0,
         .sda_io = GPIO_NUM_5,
@@ -146,14 +483,28 @@ void app_main(void)
         .int_io = -1,
     };
 
-    if (imu_module_init(&g_runtime.imu) != ESP_OK) {
-        ESP_LOGW(TAG, "IMU init failed, continuing to motor test...");
-    } else {
-        if (imu_module_probe(&g_runtime.imu, 2000)) {
+    // BNO085 needs time to boot after power-on; without this delay the probe
+    // fails on fast resets before the sensor's SH-2 firmware is ready.
+    vTaskDelay(pdMS_TO_TICKS(150));
+
+    bool imu_ready = false;
+    for (int attempt = 1; attempt <= 3 && !imu_ready; attempt++) {
+        if (imu_module_init(&g_runtime.imu) != ESP_OK) {
+            ESP_LOGW(TAG, "IMU init failed (attempt %d/3)", attempt);
+        } else if (imu_module_probe(&g_runtime.imu, 2000)) {
             bno08x_enable_game_rv(10000);
             bno08x_enable_gyroscope(10000);
-            ESP_LOGI(TAG, "IMU Ready");
+            ESP_LOGI(TAG, "IMU Ready (attempt %d/3)", attempt);
+            imu_ready = true;
+        } else {
+            ESP_LOGW(TAG, "IMU probe timed out (attempt %d/3)", attempt);
         }
+        if (!imu_ready && attempt < 3) {
+            vTaskDelay(pdMS_TO_TICKS(200));
+        }
+    }
+    if (!imu_ready) {
+        ESP_LOGW(TAG, "IMU not detected after 3 attempts, continuing without IMU");
     }
 
     if (motor_module_tmc2240_spi_init(TMC_SPI_HOST,
@@ -177,11 +528,11 @@ void app_main(void)
     }
 
     TMC2240_RobotConfig_t silent_config = {
-        .run_current_ma = 800,
-        .hold_current_ma = 200,
-        .microsteps = 16,
+        .run_current_ma = 1200,
+        .hold_current_ma = 300,
+        .microsteps = 8,
         .interpolate = true,
-        .stealth_threshold = 500,
+        .stealth_threshold = 0,
         .stall_sensitivity = 0,
         .cool_step_enabled = false,
     };
@@ -196,27 +547,84 @@ void app_main(void)
     g_runtime.motor_hal.right.dir_pin = TMC_RIGHT_DIR;
     g_runtime.motor_hal.right.en_pin = TMC_EN;
     g_runtime.motor_hal.right.en_active_low = true;
-    g_runtime.motor_hal.max_step_hz = 2000.0f;
+    g_runtime.motor_hal.max_step_hz = DEFAULT_MAX_STEP_HZ;
     motor_module_init(&g_runtime.motor_hal);
     motor_module_set_enabled(&g_runtime.motor_hal, false);
+
+    // EN pin is now active (TMC2240 drivers live). Wait for AT#1 standstill
+    // tuning to converge (~130ms), then freeze the learned OFS/GRAD so
+    // StealthChop2 never re-runs the noisy convergence on start commands.
+    // No motor test needed: both EN pins share GPIO 18 so they cannot be
+    // independently gated, and AT#1 converges purely from standstill.
+    vTaskDelay(pdMS_TO_TICKS(200));
+    motor_module_tmc2240_freeze_tuning();
+
+    // Disable watchdog interrupts to reduce motor control jitter
+    // (DIAG interrupts were causing audible artifacts in motor noise)
+    g_runtime.safety_watchdog.diag_left_io = -1;
+    g_runtime.safety_watchdog.diag_right_io = -1;
+    safety_watchdog_init(&g_runtime.safety_watchdog);
+
+    // Initialize control command queue (Length 1, overwrite keeps only latest command)
+    g_runtime.control_cmd_queue = xQueueCreate(1, sizeof(robot_control_command_t));
+    if (g_runtime.control_cmd_queue == NULL) {
+        ESP_LOGE(TAG, "Failed to create control command queue");
+        return;
+    }
+    // Initialize state estimator for pose calculation
+    state_estimator_init(&g_runtime.state_estimator);
+
+    // Initialize telemetry on port 1234
+    telemetry_comms_init(&g_runtime.telemetry_comms);
+
+    // Initialize PID config
+    pid_controller_init(&g_runtime.balance_pid,
+                        DEFAULT_PID_KP,
+                        DEFAULT_PID_KI,
+                        DEFAULT_PID_KD,
+                        -g_runtime.motor_hal.max_step_hz,
+                        g_runtime.motor_hal.max_step_hz);
+    g_runtime.target_pitch_deg = 0.0f; // Stand perfectly upright
+    g_runtime.dynamic_target_pitch_deg = g_runtime.target_pitch_deg;
+    g_runtime.velocity_gain = DEFAULT_VELOCITY_GAIN;
+
+    command_parser_init(&g_runtime.command_parser);
+
+    if (udp_command_receiver_init() != ESP_OK) {
+        ESP_LOGE(TAG, "UDP command receiver failed to start");
+    } else {
+        ESP_LOGI(TAG, "UDP command receiver enabled on port 5555");
+    }
+
+    ESP_LOGI(TAG, "FIRMWARE v8 — Combined 100Hz IMU/control loop");
 
     if (xTaskCreatePinnedToCore(control_task_fn,
                                 "control_core1",
                                 4096,
                                 &g_runtime,
-                                5,
-                                &g_runtime.control_task,
+                                5, // Highest priority
+                                &g_runtime.control_task_handle,
                                 1) != pdPASS) {
         ESP_LOGE(TAG, "Failed to create control task on Core 1");
         return;
     }
 
+    const esp_timer_create_args_t balance_timer_args = {
+        .callback = balance_timer_callback,
+        .arg = &g_runtime,
+        .dispatch_method = ESP_TIMER_TASK,
+        .name = "balance_timer",
+    };
+    ESP_ERROR_CHECK(esp_timer_create(&balance_timer_args, &g_runtime.balance_timer_handle));
+    ESP_ERROR_CHECK(esp_timer_start_periodic(g_runtime.balance_timer_handle, BALANCE_PERIOD_US));
+    ESP_LOGI(TAG, "Balance timer event enabled at %u us", (unsigned)BALANCE_PERIOD_US);
+
     if (xTaskCreatePinnedToCore(supervisor_task_fn,
                                 "supervisor_core0",
                                 4096,
                                 &g_runtime,
-                                2,
-                                &g_runtime.supervisor_task,
+                                2, // Low priority
+                                NULL,
                                 0) != pdPASS) {
         ESP_LOGE(TAG, "Failed to create supervisor task on Core 0");
         return;

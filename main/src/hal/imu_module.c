@@ -62,8 +62,10 @@ static void imu_reset_report_state(imu_module_t *imu)
     imu->pitch_deg = 0.0f;
     imu->roll_deg = 0.0f;
     imu->gyro_pitch_dps = 0.0f;
+    imu->lin_accel_x = 0.0f;
     imu->orientation_valid = false;
     imu->gyro_valid = false;
+    imu->lin_accel_valid = false;
     imu->control_seq = 0;
     memset((void *)&imu->sensor_value, 0, sizeof(imu->sensor_value));
 }
@@ -335,11 +337,16 @@ static void imu_sensor_callback(void *cookie, sh2_SensorEvent_t *event)
                                         temp.un.gameRotationVector.k);
         imu->orientation_valid = true;
     } else if (temp.sensorId == SH2_GYROSCOPE_CALIBRATED) {
-        // Since the IMU is mounted vertically for balancing, 
+        // Since the IMU is mounted vertically for balancing,
         // the gyro axis we care about depends on mounting.
-        // Assuming pitch is around X or Y. 
-        imu->gyro_pitch_dps = temp.un.gyroscope.y * 57.2957795f; 
+        // Assuming pitch is around X or Y.
+        imu->gyro_pitch_dps = temp.un.gyroscope.y * 57.2957795f;
         imu->gyro_valid = true;
+    } else if (temp.sensorId == SH2_LINEAR_ACCELERATION) {
+        // Linear acceleration with gravity removed (m/s^2).
+        // The forward/backward axis of the robot — adjust sign/axis to match mounting.
+        imu->lin_accel_x = temp.un.linearAcceleration.x;
+        imu->lin_accel_valid = true;
     }
 
     imu->have_sample = true;
@@ -468,12 +475,10 @@ bool imu_module_probe(imu_module_t *imu, uint32_t timeout_ms)
 void imu_module_enable_default_reports(imu_module_t *imu)
 {
     (void)imu;
-    // Enable Game Rotation Vector (Yaw/Pitch/Roll) + Calibrated Gyro
-    // 10ms (100Hz) is better for balancing if I2C holds up. 
-    // Starting with 20ms (50Hz) for stability.
     uint32_t interval = 20000;
     (void)bno08x_enable_game_rv(interval);
     (void)bno08x_enable_gyroscope(interval);
+    (void)imu_enable_report(SH2_LINEAR_ACCELERATION, interval);
 }
 
 void imu_module_poll_and_log(imu_module_t *imu)
@@ -508,6 +513,7 @@ esp_err_t imu_module_read_sample(imu_module_t *imu, imu_sample_t *sample)
     sample->pitch_deg = imu->pitch_deg - imu->tilt_zero_deg;
     sample->roll_deg = imu->roll_deg;
     sample->gyro_pitch_dps = imu->gyro_pitch_dps;
+    sample->lin_accel_x = imu->lin_accel_x;
     sample->timestamp_us = esp_timer_get_time();
 
     return imu->orientation_valid ? ESP_OK : ESP_ERR_INVALID_STATE;

@@ -12,6 +12,7 @@ idf_component_register(
         "src/supervisor/parameter_manager.c"
         "src/supervisor/telemetry_comms.c"
         "src/supervisor/udp_logging.c"
+        "src/supervisor/udp_command_receiver.c"
         "src/third_party/bno08x/sh2.c"
         "src/third_party/bno08x/sh2_SensorValue.c"
         "src/third_party/bno08x/sh2_util.c"

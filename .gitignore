@@ -48,6 +48,15 @@ cmake_install.cmake
 install_manifest.txt
 CTestTestfile.cmake
 
+# Debug and analysis scripts (local development only)
+debug_*.py
+*_debug.py
+debug_*.txt
+register_dump*.txt
+
+# CSV telemetry logs
+logs/
+
 # Python environment files
 *.pyc
 *.pyo
@@ -83,3 +92,5 @@ Desktop.ini
 *.workspace # General workspace files, can be from various tools
 *.suo       # Visual Studio Solution User Options
 *.sln.docstates # Visual Studio
+
+todo.md

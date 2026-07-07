@@ -11,10 +11,15 @@ typedef enum {
 } robot_state_t;
 
 typedef struct {
+    float quat_w;
+    float quat_x;
+    float quat_y;
+    float quat_z;
     float roll_deg;
     float pitch_deg;
     float yaw_deg;
     float gyro_pitch_dps;
+    float lin_accel_x;
     int64_t timestamp_us;
 } imu_sample_t;
 
@@ -24,6 +29,7 @@ typedef struct {
     float roll_deg;
     float tilt_deg;
     float tilt_rate_dps;
+    float lin_accel_x;
     int64_t timestamp_us;
 } robot_pose_t;
 

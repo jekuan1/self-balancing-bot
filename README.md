@@ -36,6 +36,48 @@ The current bench-test firmware is focused on getting the motors spinning safely
 
 At startup the firmware configures both TMC2240s, enables the motor outputs, commands a constant step rate, and then disables the motors after 10 seconds. Logging is tagged as `motor_test`.
 
+## Live tuning
+
+Run the UDP monitor while connected to the robot AP:
+
+```sh
+python3 monitor.py
+```
+
+Useful tuning commands:
+
+- `pid <kp> <ki> <kd>` updates all PID gains.
+- `kp <value>`, `kd <value>`, `kp+ <delta>`, and `kd- <delta>` adjust one gain at a time.
+- `kvel <value>`, `kvel+ <delta>`, and `kvel- <delta>` tune the velocity-to-pitch dynamic-target gain.
+- `cap <hz>` changes the motor step-rate cap live. Firmware clamps this into its allowed range.
+- `preset soft`, `preset base`, and `preset strong` send quick starting combinations.
+- `target <deg>` changes the balance pitch target.
+
+The dashboard shows PID output in Hz, the active cap, and saturation percent. If saturation sits near 100% during recoverable lean angles, the controller is asking for more motor speed than the current cap allows. Raising the cap can help only up to the physical motor/driver/battery limit; beyond that, more PID output will not produce more torque or speed.
+
+CSV logs are written under `logs/` and now record telemetry only while balance control is active between `start` and `stop`. To plot a run:
+
+```sh
+python3 plot_robot_log.py logs/<log-file>.csv
+```
+
+To save the plot:
+
+```sh
+python3 plot_robot_log.py logs/<log-file>.csv --save plots/run.png --no-show
+```
+
+## Control events
+
+The firmware now has four interrupt/event-style sources:
+
+- Software e-stop event: send `stop` from `monitor.py`; the control task is woken immediately and commands both motors to `0 Hz`.
+- Motor step timer: already active in `motor_module.c`; it services step pulses every `10 us`.
+- Balance timer: wakes the control task every `10 ms` to poll the IMU, run PID, and apply motor commands.
+- IMU timeout watchdog: if 5 balance ticks pass without a valid IMU sample, it triggers the same e-stop path.
+
+Normal drive/tuning commands still arrive through UDP and wake the control task, but balance and e-stop handling take priority.
+
 ## Repository structure
 
 ESP-IDF projects are built using CMake. The project build configuration is contained in `CMakeLists.txt` files that provide set of directives and instructions describing the project's source files and targets (executable, library, or both).

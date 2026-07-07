@@ -1,0 +1,660 @@
+#!/usr/bin/env python3
+"""Robot Monitor: live single-line dashboard + UDP command sender."""
+# python3 monitor.py
+
+import argparse
+import csv
+import os
+import re
+import select
+import socket
+import termios
+import threading
+import time
+import shutil
+from datetime import datetime
+import sys
+
+
+class RobotMonitor:
+    LOG_PORT = 5556
+    TELEMETRY_PORT = 1234
+    DASHBOARD_LINES = 5
+
+    def __init__(self, robot_ip="192.168.4.1", robot_port=5555, telemetry_port=1234, log_port=5556):
+        self.robot_ip = robot_ip
+        self.robot_port = robot_port
+        self.telemetry_port = telemetry_port
+        self.log_port = log_port
+        self.running = True
+
+        self.prompt = "> "
+        self.state_lock = threading.RLock()
+        self.print_lock = threading.RLock()
+        self.redraw_event = threading.Event()
+
+        self.latest_log_time = "--:--:--.---"
+        self.left_temp_c = None
+        self.right_temp_c = None
+        self.left_sg = None
+        self.right_sg = None
+        self.left_cs = None
+        self.right_cs = None
+        self.kp = 600.0
+        self.ki = 0.0
+        self.kd = 20.0
+        self.target_pitch_deg = 0.0
+        self.dynamic_target_pitch_deg = 0.0
+        self.velocity_gain = 10.0
+        self.control_output_hz = 0.0
+        self.max_step_hz = 1500.0
+        self.saturation_pct = 0.0
+        self.left_step_hz = 0.0
+        self.right_step_hz = 0.0
+        self.yaw_deg = 0.0
+        self.pitch_deg = 0.0
+        self.roll_deg = 0.0
+        self.tilt_rate_dps = 0.0
+        self.lin_accel_x = 0.0
+        self.last_command = "idle"
+        self.is_active = False
+
+        self._last_action_key = None
+        self._last_action_time = 0.0
+
+        # CSV logging
+        self._csv_file = None
+        self._csv_writer = None
+        self._csv_lock = threading.Lock()
+        self._init_csv()
+
+        self.ANSI = {
+            'reset': '\x1b[0m',
+            'bold': '\x1b[1m',
+            'dim': '\x1b[2m',
+            'red': '\x1b[31m',
+            'green': '\x1b[32m',
+            'yellow': '\x1b[33m',
+            'cyan': '\x1b[36m',
+        }
+
+    def _init_csv(self):
+        log_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
+        os.makedirs(log_dir, exist_ok=True)
+        filename = datetime.now().strftime("robot_%Y%m%d_%H%M%S.csv")
+        path = os.path.join(log_dir, filename)
+        self._csv_file = open(path, "w", newline="", buffering=1)
+        self._csv_writer = csv.writer(self._csv_file)
+        self._csv_writer.writerow([
+            "timestamp", "pitch_deg", "roll_deg", "yaw_deg", "tilt_rate_dps", "lin_accel_x",
+            "left_temp_c", "right_temp_c", "left_sg", "right_sg",
+            "left_cs", "right_cs",
+            "kp", "ki", "kd", "target_pitch_deg", "dynamic_target_pitch_deg",
+            "velocity_gain", "control_output_hz", "max_step_hz", "saturation_pct",
+            "left_step_hz", "right_step_hz", "is_active",
+        ])
+        print(f"[CSV] Logging to {path}")
+
+    def _csv_log(self):
+        with self._csv_lock:
+            if self._csv_writer is None:
+                return
+            with self.state_lock:
+                if not self.is_active:
+                    return
+                row = [
+                    datetime.now().strftime("%H:%M:%S.%f")[:-3],
+                    self.pitch_deg, self.roll_deg, self.yaw_deg, self.tilt_rate_dps, self.lin_accel_x,
+                    self.left_temp_c, self.right_temp_c, self.left_sg, self.right_sg,
+                    self.left_cs, self.right_cs,
+                    self.kp, self.ki, self.kd, self.target_pitch_deg,
+                    self.dynamic_target_pitch_deg, self.velocity_gain, self.control_output_hz,
+                    self.max_step_hz, self.saturation_pct,
+                    self.left_step_hz, self.right_step_hz,
+                    1 if self.is_active else 0,
+                ]
+            self._csv_writer.writerow(row)
+
+    def _set_state(self, **kwargs):
+        with self.state_lock:
+            for key, value in kwargs.items():
+                setattr(self, key, value)
+        self.redraw_event.set()
+
+    def _format_float(self, value, precision=1, empty="--"):
+        if value is None:
+            return empty
+        return f"{value:.{precision}f}"
+
+    def _fit_line(self, text):
+        width = shutil.get_terminal_size(fallback=(100, 20)).columns
+        if width <= 0 or len(text) <= width:
+            return text
+        if width <= 3:
+            return text[:width]
+        return text[: width - 3] + "..."
+
+    def _format_dashboard(self):
+        with self.state_lock:
+            left_temp  = self._format_float(self.left_temp_c, precision=1)
+            right_temp = self._format_float(self.right_temp_c, precision=1)
+            left_sg    = self._format_float(self.left_sg, precision=0, empty="--")
+            right_sg   = self._format_float(self.right_sg, precision=0, empty="--")
+            left_cs    = str(self.left_cs)  if self.left_cs  is not None else "--"
+            right_cs   = str(self.right_cs) if self.right_cs is not None else "--"
+            kp           = self._format_float(self.kp, precision=2)
+            ki           = self._format_float(self.ki, precision=2)
+            kd           = self._format_float(self.kd, precision=2)
+            target_pitch = self._format_float(self.target_pitch_deg, precision=2)
+            dynamic_target = self._format_float(self.dynamic_target_pitch_deg, precision=2)
+            velocity_gain = self._format_float(self.velocity_gain, precision=3)
+            output_hz    = self._format_float(self.control_output_hz, precision=0)
+            max_hz       = self._format_float(self.max_step_hz, precision=0)
+            sat_pct      = self._format_float(self.saturation_pct, precision=0)
+            left_hz      = self._format_float(self.left_step_hz, precision=0)
+            right_hz     = self._format_float(self.right_step_hz, precision=0)
+            yaw          = self._format_float(self.yaw_deg, precision=1)
+            pitch        = self._format_float(self.pitch_deg, precision=1)
+            roll         = self._format_float(self.roll_deg, precision=1)
+            tilt_rate    = self._format_float(self.tilt_rate_dps, precision=1)
+            lin_accel_x  = self._format_float(self.lin_accel_x, precision=2)
+            is_active    = self.is_active
+
+        width = shutil.get_terminal_size(fallback=(120, 24)).columns
+        now    = datetime.now().strftime("%H:%M:%S")
+        status = f"{self.ANSI['green']}ACTIVE{self.ANSI['reset']}" if is_active else f"{self.ANSI['dim']}IDLE{self.ANSI['reset']}"
+        sep    = self.ANSI['dim'] + "─" * width + self.ANSI['reset']
+
+        row1 = (f" Temps   L: {left_temp}°C   R: {right_temp}°C"
+                f"   │   CS   L: {left_cs}   R: {right_cs}"
+                f"   │   SG   L: {left_sg}   R: {right_sg}"
+                f"   │   {status}   {now}")
+        row2 = (f" PID     kp: {kp}   ki: {ki}   kd: {kd}   kvel: {velocity_gain}   target: {target_pitch}°   dyn: {dynamic_target}°")
+        row3 = (f" Motor   out: {output_hz} Hz   L: {left_hz} Hz   R: {right_hz} Hz   cap: {max_hz} Hz   sat: {sat_pct}%")
+        row4 = (f" Pose    yaw: {yaw}°   pitch: {pitch}°   roll: {roll}°   rate: {tilt_rate} °/s   accel: {lin_accel_x} m/s²")
+
+        return [sep, row1, row2, row3, row4]
+
+    def _redraw_dashboard_line(self):
+        rows = self._format_dashboard()
+        with self.print_lock:
+            try:
+                sys.stdout.write("\x1b7")  # save cursor
+                for i, row in enumerate(rows):
+                    sys.stdout.write(f"\x1b[{i + 1};1H\x1b[2K{row}")
+                sys.stdout.write("\x1b8")  # restore cursor
+                sys.stdout.flush()
+            except Exception:
+                pass
+
+    def _update_from_log(self, message):
+        now = datetime.now()
+        self._set_state(latest_log_time=now.strftime("%H:%M:%S.%f")[:-3])
+
+        tmc_match = re.search(
+            r"TMC\s+[—-]\s+LEFT:\s+([0-9.]+)\s+C,\s+[0-9.]+\s+mA,\s+CS=(\d+).*?SG=(\d+|stst)"
+            r".*\|\s+RIGHT:\s+([0-9.]+)\s+C,\s+[0-9.]+\s+mA,\s+CS=(\d+).*?SG=(\d+|stst)",
+            message,
+        )
+        if tmc_match:
+            def _parse_sg(s):
+                return None if s == "stst" else float(s)
+            self._set_state(
+                left_temp_c=float(tmc_match.group(1)),
+                left_cs=int(tmc_match.group(2)),
+                left_sg=_parse_sg(tmc_match.group(3)),
+                right_temp_c=float(tmc_match.group(4)),
+                right_cs=int(tmc_match.group(5)),
+                right_sg=_parse_sg(tmc_match.group(6)),
+            )
+        else:
+            temp_match = re.search(
+                r"TMC\s+[—-]\s+LEFT:\s+([0-9.]+)\s+C.*\|\s+RIGHT:\s+([0-9.]+)\s+C",
+                message,
+            )
+            if temp_match:
+                self._set_state(
+                    left_temp_c=float(temp_match.group(1)),
+                    right_temp_c=float(temp_match.group(2)),
+                )
+
+        low = message.lower()
+        if low.startswith("command:") or " start" in low or low == "start" or " stop" in low or low == "stop":
+            words = low.split()
+            key = next(
+                (w for w in ("start", "stop", "forward", "backward", "left", "right") if w in words),
+                low.strip()[:20],
+            )
+
+            now_t = time.time()
+            show = False
+            with self.state_lock:
+                if key != self._last_action_key or now_t - self._last_action_time > 2.0:
+                    self._last_action_key = key
+                    self._last_action_time = now_t
+                    show = True
+
+            if show:
+                ts = datetime.now().strftime("%H:%M:%S")
+                with self.print_lock:
+                    print(
+                        f"  {self.ANSI['cyan']}▶{self.ANSI['reset']}"
+                        f" {self.ANSI['bold']}{key.upper()}{self.ANSI['reset']}"
+                        f"  received  [{ts}]"
+                    )
+
+        target_match = re.search(r"Target pitch set:\s+([0-9.+-]+)\s+deg", message)
+        if target_match:
+            self._set_state(target_pitch_deg=float(target_match.group(1)))
+
+        pid_match = re.search(r"PID tuned:\s+kp=([0-9.+-]+)\s+ki=([0-9.+-]+)\s+kd=([0-9.+-]+)", message)
+        if pid_match:
+            self._set_state(
+                kp=float(pid_match.group(1)),
+                ki=float(pid_match.group(2)),
+                kd=float(pid_match.group(3)),
+                last_command=f"PID tuned {pid_match.group(1)}/{pid_match.group(2)}/{pid_match.group(3)}",
+            )
+
+        cap_match = re.search(r"Motor max step rate set:\s+([0-9.+-]+)\s+Hz", message)
+        if cap_match:
+            self._set_state(
+                max_step_hz=float(cap_match.group(1)),
+                last_command=f"cap {cap_match.group(1)} Hz",
+            )
+
+        vel_gain_match = re.search(r"Velocity gain set:\s+k_vel_p=([0-9.+-]+)", message)
+        if vel_gain_match:
+            self._set_state(
+                velocity_gain=float(vel_gain_match.group(1)),
+                last_command=f"kvel {vel_gain_match.group(1)}",
+            )
+
+    def _update_from_telemetry(self, payload):
+        parts = [part.strip() for part in payload.split(",") if part.strip()]
+        if len(parts) < 3:
+            return
+
+        try:
+            yaw = float(parts[0])
+            pitch = float(parts[1])
+            roll = float(parts[2])
+            tilt_rate = float(parts[3]) if len(parts) >= 4 else None
+            lin_accel_x = float(parts[4]) if len(parts) >= 5 else None
+            target_pitch = float(parts[5]) if len(parts) >= 6 else None
+            dynamic_target = float(parts[6]) if len(parts) >= 7 else None
+            if len(parts) >= 14:
+                velocity_gain = float(parts[7])
+                control_output = float(parts[8])
+                max_step_hz = float(parts[9])
+                saturation_pct = float(parts[10])
+                left_step_hz = float(parts[11])
+                right_step_hz = float(parts[12])
+                is_active = bool(int(float(parts[13])))
+            else:
+                velocity_gain = None
+                control_output = float(parts[7]) if len(parts) >= 8 else None
+                max_step_hz = float(parts[8]) if len(parts) >= 9 else None
+                saturation_pct = float(parts[9]) if len(parts) >= 10 else None
+                left_step_hz = float(parts[10]) if len(parts) >= 11 else None
+                right_step_hz = float(parts[11]) if len(parts) >= 12 else None
+                is_active = bool(int(float(parts[12]))) if len(parts) >= 13 else None
+        except ValueError:
+            return
+
+        update = dict(yaw_deg=yaw, pitch_deg=pitch, roll_deg=roll)
+        if tilt_rate is not None:
+            update["tilt_rate_dps"] = tilt_rate
+        if lin_accel_x is not None:
+            update["lin_accel_x"] = lin_accel_x
+        if target_pitch is not None:
+            update["target_pitch_deg"] = target_pitch
+        if dynamic_target is not None:
+            update["dynamic_target_pitch_deg"] = dynamic_target
+        if velocity_gain is not None:
+            update["velocity_gain"] = velocity_gain
+        if control_output is not None:
+            update["control_output_hz"] = control_output
+        if max_step_hz is not None:
+            update["max_step_hz"] = max_step_hz
+        if saturation_pct is not None:
+            update["saturation_pct"] = saturation_pct
+        if left_step_hz is not None:
+            update["left_step_hz"] = left_step_hz
+        if right_step_hz is not None:
+            update["right_step_hz"] = right_step_hz
+        if is_active is not None:
+            update["is_active"] = is_active
+        self._set_state(**update)
+        self._csv_log()
+
+    def _listener_loop(self, listen_port, handler, label):
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sock.settimeout(0.2)
+
+        try:
+            sock.bind(("0.0.0.0", listen_port))
+        except OSError as exc:
+            self._set_state(last_command=f"{label} bind failed: {exc}")
+            return
+
+        while self.running:
+            try:
+                data, _addr = sock.recvfrom(2048)
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+
+            message = data.decode("utf-8", errors="replace").strip()
+            if message:
+                handler(message)
+
+        sock.close()
+
+    def _log_listener(self):
+        self._listener_loop(self.log_port, self._update_from_log, "log")
+
+    def _telemetry_listener(self):
+        self._listener_loop(self.telemetry_port, self._update_from_telemetry, "telemetry")
+
+    def send_command(self, cmd):
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            sock.sendto(cmd.encode("utf-8"), (self.robot_ip, self.robot_port))
+            sock.close()
+        except Exception as exc:
+            self._set_state(last_command=f"TX failed: {exc}")
+            return False
+
+        if cmd == "start":
+            self._set_state(last_command="start", is_active=True)
+        elif cmd == "stop":
+            self._set_state(last_command="stop", is_active=False)
+        else:
+            update = {"last_command": cmd}
+            parts = cmd.split()
+            if len(parts) >= 5 and parts[0] == "tune" and parts[1] == "pid":
+                try:
+                    update.update(kp=float(parts[2]), ki=float(parts[3]), kd=float(parts[4]))
+                except ValueError:
+                    pass
+            elif len(parts) >= 3 and parts[0] == "tune" and parts[1] in ("vel", "kvel", "velocity"):
+                try:
+                    update["velocity_gain"] = float(parts[2])
+                except ValueError:
+                    pass
+            elif len(parts) >= 3 and parts[0] == "set" and parts[1] in ("max_hz", "cap"):
+                try:
+                    update["max_step_hz"] = float(parts[2])
+                except ValueError:
+                    pass
+            elif len(parts) >= 3 and parts[0] == "set" and parts[1] == "target":
+                try:
+                    update["target_pitch_deg"] = float(parts[2])
+                except ValueError:
+                    pass
+            self._set_state(**update)
+        return True
+
+    def _dashboard_renderer(self):
+        while self.running:
+            self.redraw_event.wait(0.2)
+            self.redraw_event.clear()
+            self._redraw_dashboard_line()
+
+    def _readline_simple(self, prompt):
+        """Raw-mode line reader: handles DEL/^H as backspace, drains escape seqs."""
+        if not sys.stdin.isatty():
+            return input(prompt)
+
+        with self.print_lock:
+            sys.stdout.write(prompt)
+            sys.stdout.flush()
+
+        fd = sys.stdin.fileno()
+        old = termios.tcgetattr(fd)
+        new = termios.tcgetattr(fd)
+        # Disable canonical mode, echo, signal chars — but leave OPOST alone
+        # so background print() calls still get the \n→\r\n translation.
+        new[3] &= ~(termios.ECHO | termios.ICANON | termios.IEXTEN | termios.ISIG)
+        new[6][termios.VMIN] = 1
+        new[6][termios.VTIME] = 0
+        termios.tcsetattr(fd, termios.TCSADRAIN, new)
+        buf = []
+        try:
+            while True:
+                ch = sys.stdin.read(1)
+                if ch in ('\r', '\n'):
+                    with self.print_lock:
+                        sys.stdout.write('\n')
+                        sys.stdout.flush()
+                    return ''.join(buf)
+                if ch == '\x03':
+                    raise KeyboardInterrupt
+                if ch == '\x04':
+                    raise EOFError
+                if ch in ('\x7f', '\x08'):
+                    if buf:
+                        buf.pop()
+                        with self.print_lock:
+                            sys.stdout.write('\x08 \x08')
+                            sys.stdout.flush()
+                elif ch == '\x1b':
+                    # Drain escape sequence (arrow keys, forward-delete, etc.)
+                    r, _, _ = select.select([sys.stdin], [], [], 0.05)
+                    if r:
+                        nxt = sys.stdin.read(1)
+                        if nxt == '[':
+                            while True:
+                                r2, _, _ = select.select([sys.stdin], [], [], 0.05)
+                                if not r2:
+                                    break
+                                c = sys.stdin.read(1)
+                                if c.isalpha() or c == '~':
+                                    break
+                elif ord(ch) >= 32:
+                    buf.append(ch)
+                    with self.print_lock:
+                        sys.stdout.write(ch)
+                        sys.stdout.flush()
+        finally:
+            termios.tcsetattr(fd, termios.TCSADRAIN, old)
+
+    def interactive_shell(self):
+        height = shutil.get_terminal_size(fallback=(120, 24)).lines
+        prompt_row = self.DASHBOARD_LINES + 1
+        # Clear screen and lock rows 1-DASHBOARD_LINES as a fixed header.
+        # Scroll region confines all input/output to prompt_row..height so
+        # dashboard writes to rows 1-5 never corrupt the input area.
+        sys.stdout.write(
+            "\x1b[2J\x1b[H"                          # clear screen
+            f"\x1b[{prompt_row};{height}r"            # set scroll region
+            f"\x1b[{prompt_row};1H"                   # move cursor into scroll region
+        )
+        sys.stdout.flush()
+        self._redraw_dashboard_line()
+
+        try:
+            while self.running:
+                try:
+                    cmd = self._readline_simple(self.prompt).strip()
+                except (KeyboardInterrupt, EOFError):
+                    self.running = False
+                    break
+
+                if not cmd:
+                    continue
+
+                if cmd.lower() in ("quit", "exit"):
+                    self.running = False
+                    break
+
+                if cmd.lower() == "help":
+                    self.print_help()
+                    continue
+
+                cmd = self._expand_shortcut(cmd)
+                self.send_command(cmd)
+        finally:
+            # Reset scroll region and leave terminal in a clean state
+            sys.stdout.write("\x1b[r\x1b[2J\x1b[H")
+            sys.stdout.flush()
+
+        with self._csv_lock:
+            if self._csv_file is not None:
+                self._csv_file.close()
+                self._csv_file = None
+                self._csv_writer = None
+        print("[*] Exiting...")
+
+    def _expand_shortcut(self, cmd):
+        parts = cmd.split()
+        if not parts:
+            return cmd
+        key = parts[0].lower()
+        if key in ("tl", "tr"):
+            side = "left" if key == "tl" else "right"
+            hz  = parts[1] if len(parts) > 1 else "500"
+            ms  = parts[2] if len(parts) > 2 else "1000"
+            return f"motor_test {side} {hz} {ms}"
+        if key in ("cap", "max", "maxhz", "max_hz") and len(parts) >= 2:
+            return f"set max_hz {parts[1]}"
+        if key in ("target", "tgt") and len(parts) >= 2:
+            return f"set target {parts[1]}"
+        if key == "pid" and len(parts) >= 4:
+            return f"tune pid {parts[1]} {parts[2]} {parts[3]}"
+        if key in ("kvel", "vel", "velocity_gain") and len(parts) >= 2:
+            return f"tune vel {parts[1]}"
+        if key in ("kvel+", "vel+") and len(parts) >= 2:
+            return self._velocity_gain_command_with(parts[1], relative=True)
+        if key in ("kvel-", "vel-") and len(parts) >= 2:
+            return self._velocity_gain_command_with(f"-{parts[1]}", relative=True)
+        if key in ("kp", "ki", "kd") and len(parts) >= 2:
+            return self._pid_command_with(key, parts[1], relative=False)
+        if key in ("kp+", "ki+", "kd+") and len(parts) >= 2:
+            return self._pid_command_with(key[:2], parts[1], relative=True)
+        if key in ("kp-", "ki-", "kd-") and len(parts) >= 2:
+            return self._pid_command_with(key[:2], f"-{parts[1]}", relative=True)
+        if key == "preset" and len(parts) >= 2:
+            preset = parts[1].lower()
+            presets = {
+                "soft": (250.0, 0.0, 25.0, 1000.0),
+                "base": (600.0, 0.0, 20.0, 1500.0),
+                "strong": (700.0, 0.0, 90.0, 2500.0),
+            }
+            if preset in presets:
+                kp, ki, kd, cap = presets[preset]
+                self.send_command(f"set max_hz {cap}")
+                time.sleep(0.05)
+                return f"tune pid {kp} {ki} {kd}"
+        return cmd
+
+    def _pid_command_with(self, gain, value_text, relative):
+        try:
+            value = float(value_text)
+        except ValueError:
+            return value_text
+
+        with self.state_lock:
+            kp = self.kp
+            ki = self.ki
+            kd = self.kd
+
+        if gain == "kp":
+            kp = kp + value if relative else value
+        elif gain == "ki":
+            ki = ki + value if relative else value
+        elif gain == "kd":
+            kd = kd + value if relative else value
+
+        kp = max(0.0, kp)
+        ki = max(0.0, ki)
+        kd = max(0.0, kd)
+        return f"tune pid {kp:.6g} {ki:.6g} {kd:.6g}"
+
+    def _velocity_gain_command_with(self, value_text, relative):
+        try:
+            value = float(value_text)
+        except ValueError:
+            return value_text
+
+        with self.state_lock:
+            velocity_gain = self.velocity_gain
+
+        velocity_gain = velocity_gain + value if relative else value
+        return f"tune vel {velocity_gain:.6g}"
+
+    def print_help(self):
+        with self.print_lock:
+            print(
+            """
+Available commands:
+  start                         Arm balance control
+  stop                          Disable motors (emergency stop)
+  tune pid <kp> <ki> <kd>       Update PID gains live
+  pid <kp> <ki> <kd>            Shortcut for tune pid
+  tune vel <k_vel_p>            Update velocity-to-pitch gain live
+  kvel <value>                  Shortcut for tune vel
+  kvel+|kvel- <delta>           Adjust velocity gain
+  kp|ki|kd <value>              Set one PID gain, preserving the other two
+  kp+|ki+|kd+ <delta>           Increase one gain
+  kp-|ki-|kd- <delta>           Decrease one gain
+  set target <deg>              Set balance point pitch angle
+  target <deg>                  Shortcut for set target
+  set max_hz <hz>               Set motor speed cap; firmware clamps hard limits
+  cap <hz>                      Shortcut for set max_hz
+  preset soft|base|strong       Send a starting PID/cap combination
+  calibrate                     Capture current pitch as balance target
+  forward <0-100>               Drive forward at speed %
+  backward <0-100>              Drive backward at speed %
+  left <0-100>                  Turn left at speed %
+  right <0-100>                 Turn right at speed %
+  motor_test left|right|both <hz> [ms]   Spin motor(s) for a timed burst
+  tl [hz] [ms]                  Shortcut: test left motor  (default 500 Hz, 1000 ms)
+  tr [hz] [ms]                  Shortcut: test right motor (default 500 Hz, 1000 ms)
+  watchdog_clear                Clear watchdog trip latch
+  help                          Show this message
+  quit                          Exit monitor
+            """.rstrip()
+        )
+
+    def run(self):
+        threads = [
+            threading.Thread(target=self._log_listener, daemon=True),
+            threading.Thread(target=self._telemetry_listener, daemon=True),
+            threading.Thread(target=self._dashboard_renderer, daemon=True),
+        ]
+        for thread in threads:
+            thread.start()
+
+        time.sleep(0.3)
+        self.redraw_event.set()
+        self.interactive_shell()
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Robot Monitor - live dashboard + command interface")
+    parser.add_argument("-i", "--robot-ip", default="192.168.4.1", help="Robot IP address (default: 192.168.4.1)")
+    parser.add_argument("-p", "--robot-port", type=int, default=5555, help="Robot command port (default: 5555)")
+    parser.add_argument("--telemetry-port", type=int, default=1234, help="Telemetry UDP port (default: 1234)")
+    parser.add_argument("--log-port", type=int, default=5556, help="Log UDP port (default: 5556)")
+
+    args = parser.parse_args()
+
+    monitor = RobotMonitor(
+        robot_ip=args.robot_ip,
+        robot_port=args.robot_port,
+        telemetry_port=args.telemetry_port,
+        log_port=args.log_port,
+    )
+
+    try:
+        monitor.run()
+    except KeyboardInterrupt:
+        monitor.running = False
+
+
+if __name__ == "__main__":
+    main()
